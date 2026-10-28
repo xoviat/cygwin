@@ -24,6 +24,7 @@ details. */
 #include "cygheap.h"
 #include "ntdll.h"
 #include "ldap.h"
+#include "tls_pbuf.h"
 
 /* General purpose security attribute objects for global use. */
 static NO_COPY_RO SECURITY_DESCRIPTOR null_sdp =
@@ -543,11 +544,107 @@ set_cygwin_privileges (HANDLE token)
 #endif
 }
 
+/* Cached identities of a confined (sandboxed) process token.  Both are
+   NO_SID for a normal, unrestricted token. */
+static cygsid confined_logon_sid (NO_SID);
+static cygsid confined_appcontainer_sid (NO_SID);
+static NO_COPY bool confined_sids_queried = false;
+
+/* Query the current process token for the identities a sandbox backend
+   presents when it opens a named object owned by the MSYS runtime:
+
+   - confined_logon_sid: the token's logon SID (SE_GROUP_LOGON_ID).  A
+     restricted token (CreateRestrictedToken, used by sandbox backends that
+     do not use an AppContainer) keeps the logon SID enabled even when the
+     user SID has been turned into a deny-only group, so it is the identity
+     such a confined client reliably presents.  See dsh-win-gitbash#10:
+     without it, MSYS's signal pipe self-connect fails with Win32 error 5.
+
+   - confined_appcontainer_sid: the AppContainer package SID
+     (TokenAppContainerSid).  This is the SID Windows uses to scope
+     AppContainer named objects (the
+     \Sessions\<n>\AppContainerNamedObjects\<SID> namespace).  See
+     microsoft/mxc#1061. */
+static void
+query_confined_sids ()
+{
+  NTSTATUS status;
+  ULONG size;
+  HANDLE token = NULL;
+  PTOKEN_GROUPS groups;
+  tmp_pathbuf tp;
+
+  if (confined_sids_queried)
+    return;
+  confined_sids_queried = true;
+
+  status = NtOpenProcessToken (NtCurrentProcess (), TOKEN_QUERY, &token);
+  if (!NT_SUCCESS (status))
+    {
+      debug_printf ("NtOpenProcessToken: %y", status);
+      return;
+    }
+
+  /* Logon SID: always enabled, even in a restricted token where the user
+     SID is deny-only.  Guarded only by SE_GROUP_LOGON_ID and by not being
+     deny-only itself; TokenGroups is universally queryable. */
+  groups = (PTOKEN_GROUPS) tp.w_get ();
+  status = NtQueryInformationToken (token, TokenGroups, groups,
+				    2 * NT_MAX_PATH, &size);
+  if (NT_SUCCESS (status))
+    {
+      for (DWORD pg = 0; pg < groups->GroupCount; ++pg)
+	if ((groups->Groups[pg].Attributes & SE_GROUP_LOGON_ID)
+	    && !(groups->Groups[pg].Attributes & SE_GROUP_USE_FOR_DENY_ONLY))
+	  {
+	    confined_logon_sid = groups->Groups[pg].Sid;
+	    break;
+	  }
+    }
+  else
+    debug_printf ("NtQueryInformationToken(TokenGroups) %y", status);
+
+  /* AppContainer package SID.  Deliberately NOT gated on the
+     TokenIsAppContainer boolean: some sandboxes (MXC's ProcessContainer)
+     refuse that query with ERROR_NOACCESS while TokenAppContainerSid
+     itself answers.  The package SID is the identity such a container
+     presents when opening a named object -- granting it on the runtime's
+     private pipes is what makes MSYS's signal-pipe self-connect succeed
+     inside the container (microsoft/mxc#1061, dsh-win-gitbash#10). */
+  {
+    PTOKEN_APPCONTAINER_INFORMATION pac =
+	(PTOKEN_APPCONTAINER_INFORMATION) tp.w_get ();
+
+    status = NtQueryInformationToken (token, TokenAppContainerSid, pac,
+				      2 * NT_MAX_PATH, &size);
+    if (NT_SUCCESS (status) && pac->TokenAppContainer)
+      confined_appcontainer_sid = pac->TokenAppContainer;
+  }
+
+  NtClose (token);
+}
+
+/* Append a GENERIC_ALL allow ACE for SID to the given DACL.  Silently
+   skips a NULL SID and ignores (but logs) failures, matching the existing
+   sec_acl () error handling: an over-full DACL degrades gracefully rather
+   than aborting the process. */
+static void
+sec_acl_add_sid (PACL acl, PSID sid, const char *what)
+{
+  NTSTATUS status;
+
+  if (!sid)
+    return;
+  status = RtlAddAccessAllowedAce (acl, ACL_REVISION, GENERIC_ALL, sid);
+  if (!NT_SUCCESS (status))
+    debug_printf ("RtlAddAccessAllowedAce(%s) %y", what, status);
+}
+
 bool
 sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD access2)
 {
   NTSTATUS status;
-  size_t acl_len = MAX_DACL_LEN (5);
+  size_t acl_len = MAX_DACL_LEN (7);
   LPVOID pAce;
   cygpsid psid;
 
@@ -561,6 +658,7 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
       debug_printf ("RtlCreateAcl: %y", status);
       return false;
     }
+  query_confined_sids ();
   if (sid1)
     {
       status = RtlAddAccessAllowedAce (acl, ACL_REVISION, GENERIC_ALL, sid1);
@@ -591,6 +689,19 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
 				   well_known_system_sid);
   if (!NT_SUCCESS (status))
     debug_printf ("RtlAddAccessAllowedAce(system) %y", status);
+  /* A sandboxed process (MSYS2/Cygwin under the MXC ProcessContainer or a
+     restricted token) presents an identity the static DACL above does not
+     cover: an AppContainer client authenticates via its package SID, and a
+     restricted token may carry the user SID only as a deny-only group, so a
+     user/admin/System DACL denies the client's self-connect (e.g. MSYS's
+     signal pipe, "couldn't create signal pipe, Win32 error 5").  Grant the
+     AppContainer package SID when present; it is per-container, so nothing
+     outside the sandbox gains access.  Note the mandatory (integrity) label
+     on the object still applies, so a Medium-labelled object remains
+     unreachable from a Low-IL client -- only the DACL mismatch is fixed
+     here. */
+  sec_acl_add_sid (acl, confined_appcontainer_sid, "appcontainer");
+  sec_acl_add_sid (acl, confined_logon_sid, "logon");
   status = RtlFirstFreeAce (acl, &pAce);
   if (NT_SUCCESS (status) && pAce)
     acl->AclSize = (char *) pAce - (char *) acl;
@@ -693,7 +804,7 @@ _everyone_sd (void *buf, ACCESS_MASK access)
     {
       RtlCreateSecurityDescriptor (psd, SECURITY_DESCRIPTOR_REVISION);
       PACL dacl = (PACL) (psd + 1);
-      RtlCreateAcl (dacl, MAX_DACL_LEN (1), ACL_REVISION);
+      RtlCreateAcl (dacl, MAX_DACL_LEN (2), ACL_REVISION);
       status = RtlAddAccessAllowedAce (dacl, ACL_REVISION, access,
 				       well_known_world_sid);
       if (!NT_SUCCESS (status))
@@ -701,6 +812,24 @@ _everyone_sd (void *buf, ACCESS_MASK access)
 	  debug_printf ("RtlAddAccessAllowedAce: %y", status);
 	  return NULL;
 	}
+      /* ALL APPLICATION PACKAGES (S-1-15-2-1).  AppContainer processes
+	 are NOT covered by "Everyone" (S-1-1-0); without this ACE every
+	 object open from inside the container is denied (STATUS_ACCESS_DENIED,
+	 0xC0000022) -- e.g. the winpid.<N> symlink lookup that forks depend
+	 on (mxc#1061 / dsh-win-gitbash#10). */
+      {
+	SID apppkg;
+	SID_IDENTIFIER_AUTHORITY appauth = { { 0, 0, 0, 0, 0, 15 } };
+	if (NT_SUCCESS (RtlInitializeSid (&apppkg, &appauth, 2)))
+	  {
+	    *RtlSubAuthoritySid (&apppkg, 0) = 2; /* SECURITY_APP_PACKAGE_BASE_RID */
+	    *RtlSubAuthoritySid (&apppkg, 1) = 1; /* ALL APPLICATION PACKAGES */
+	    status = RtlAddAccessAllowedAce (dacl, ACL_REVISION, access,
+					     &apppkg);
+	    if (!NT_SUCCESS (status))
+	      debug_printf ("RtlAddAccessAllowedAce(app pkg): %y", status);
+	  }
+      }
       LPVOID ace;
       status = RtlFirstFreeAce (dacl, &ace);
       if (!NT_SUCCESS (status))

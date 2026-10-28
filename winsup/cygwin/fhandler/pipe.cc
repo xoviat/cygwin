@@ -71,6 +71,11 @@ fhandler_pipe::set_pipe_non_blocking (bool nonblocking)
 int
 fhandler_pipe::init (HANDLE f, DWORD a, mode_t mode, int64_t uniq_id)
 {
+  /* In sandboxed fork children (mxc ProcessContainer) CreateProcess handle
+     inheritance delivers present-but-wrong handle values (ACCESS_DENIED on
+     write, WAIT_ABANDONED on the mutex).  Opt into fork_fixup so all pipe
+     handles are re-duplicated from the parent instead. */
+  need_fork_fixup (true);
   /* FIXME: Have to clean this up someday
      FIXME: Do we have to check for both !get_win32_name() and
      !*get_win32_name()? */
@@ -478,9 +483,20 @@ fhandler_pipe_fifo::raw_write (const void *ptr, size_t len)
 	  pthread::static_cancel_self ();
 	  /* NOTREACHED */
 	default:
-	  /* Should not reach here. */
-	  __seterrno ();
-	  return -1;
+	  /* Should not reach here -- unless the inherited pipe_mtx handle is
+	     mangled (fork children under a sandboxing backend can get
+	     present-but-wrong inherited handles).  Re-create the mutex by
+	     name and continue writing. */
+	  {
+	    char name[MAX_PATH];
+	    const char *io = get_device () == FH_PIPER ? "input" : "output";
+	    pipe_mtx = CreateMutex (sec_none_cloexec (0), FALSE,
+				    get_mtx_name (get_handle (), io, name));
+	    if (pipe_mtx)
+	      break;
+	    __seterrno ();
+	    return -1;
+	  }
 	}
     }
   if (get_device () == FH_PIPEW && is_nonblocking ())
@@ -971,7 +987,16 @@ int
 fhandler_pipe::create (fhandler_pipe *fhs[2], unsigned psize, int mode)
 {
   HANDLE r, w;
-  SECURITY_ATTRIBUTES *sa = sec_none_cloexec (mode);
+  /* PSEC-sandbox hardening: NULL DACLs (sec_none*) become restrictive DACLs
+     in the mxc ProcessContainer, which then denies forked children (pipeline
+     writes failed with ERROR_ACCESS_DENIED).  Use the user/confinement DACL
+     instead -- the same security the signal pipe uses (sec_user, dsh#10 fix
+     in sec_acl), proven to work for children. */
+  char sa_buf[1024];
+  SECURITY_ATTRIBUTES *sa = sec_user ((PSECURITY_ATTRIBUTES) sa_buf,
+				      cygheap->user.sid ());
+  if (mode & O_CLOEXEC)
+    sa->bInheritHandle = FALSE;
   int res = -1;
   int64_t unique_id = 0; /* Compiler complains if not initialized... */
 
@@ -980,6 +1005,13 @@ fhandler_pipe::create (fhandler_pipe *fhs[2], unsigned psize, int mode)
     {
       __seterrno_from_nt_status (status);
       goto out;
+    }
+  /* mxc/PSEC: handles are created non-inheritable (inheritable named-pipe
+     objects get broken in the container); flag them afterwards. */
+  if (sa->bInheritHandle)
+    {
+      SetHandleInformation (r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+      SetHandleInformation (w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     }
   if ((fhs[0] = (fhandler_pipe *) build_fh_dev (*piper_dev)) == NULL)
     goto err_close_rw_handle;
@@ -1044,9 +1076,12 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
   r = NULL;
   w = NULL;
 
-  status = fhandler_base::npfs_handle (npfsh);
-  if (!NT_SUCCESS (status))
-    return status;
+  /* mxc/PSEC: opening the NamedPipe root (for relative names) is denied
+     (0xC0000022) inside the container, and relative/Win32 \\.\pipe names get
+     routed into a namespace whose objects deny writes.  Use absolute NT
+     names (RootDirectory = NULL) instead -- proven to work in-container. */
+  status = STATUS_SUCCESS;
+  (void) npfsh;
 
   /* Ensure that there is enough pipe buffer space for atomic writes.  */
   if (!psize)
@@ -1054,8 +1089,10 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
 
   UNICODE_STRING pipename;
   WCHAR pipename_buf[MAX_PATH];
-  size_t len = __small_swprintf (pipename_buf, L"%S-%u-",
-				 &cygheap->installation_key,
+  /* mxc/PSEC: use the CreatePipe-anonymous name pattern.  Container handle
+     inheritance drops named-pipe handles with other names (probe G/J). */
+  size_t len = __small_swprintf (pipename_buf,
+				 L"\\Device\\NamedPipe\\pipe-%u-",
 				 GetCurrentProcessId ());
 
   access = GENERIC_READ | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
@@ -1071,7 +1108,10 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
     {
       static volatile ULONG pipe_unique_id;
       LONG id = InterlockedIncrement ((LONG *) &pipe_unique_id);
-      __small_swprintf (pipename_buf + len, L"pipe-nt-%p", id);
+      /* mxc/PSEC: offset the suffix into the proven-good range (the
+         in-container pipe object for suffix -1 came back broken while
+         -9999/-12345 work; still diagnosing the exact matcher). */
+      __small_swprintf (pipename_buf + len, L"%u", (unsigned) (id + 10000));
       if (unique_id)
 	*unique_id = ((int64_t) id << 32 | GetCurrentProcessId ());
 
@@ -1081,9 +1121,12 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
 
       RtlInitUnicodeString (&pipename, pipename_buf);
 
+      /* mxc/PSEC: create WITHOUT OBJ_INHERIT (inheritable named-pipe
+	 objects get broken in the container); flag the handles for
+	 inheritance afterwards. */
       InitializeObjectAttributes (&attr, &pipename,
-				  sa_ptr->bInheritHandle ? OBJ_INHERIT : 0,
-				  npfsh, sa_ptr->lpSecurityDescriptor);
+				  0,
+				  NULL, sa_ptr->lpSecurityDescriptor);
 
       timeout.QuadPart = -500000;
       /* Set FILE_SYNCHRONOUS_IO_NONALERT flag so that native
@@ -1134,6 +1177,7 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
     }
 
   debug_printf ("NtOpenFile: name %S", &pipename);
+
 
   access = GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
   status = NtOpenFile (&w, access, &attr, &io, 0, 0);

@@ -89,6 +89,7 @@ HANDLE get_shared_parent_dir ();
 HANDLE get_session_parent_dir ();
 char *shared_name (char *, const char *, int);
 WCHAR *shared_name (WCHAR *, const WCHAR *, int);
+HANDLE open_shared_mutex (const WCHAR *, int);
 void *open_shared (const WCHAR *, int, HANDLE&, DWORD,
 		   shared_locations, PSECURITY_ATTRIBUTES = &sec_all,
 		   DWORD = FILE_MAP_READ | FILE_MAP_WRITE);

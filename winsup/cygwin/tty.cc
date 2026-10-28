@@ -70,8 +70,12 @@ tty_list::init_session ()
   char mutex_name[MAX_PATH];
   char *name = shared_name (mutex_name, "tty_list::mutex", 0);
 
-  /* tty_list::mutex is used while searching for a tty slot */
-  if (!(mutex = CreateMutex (&sec_all_nih, FALSE, name)))
+  /* tty_list::mutex is used while searching for a tty slot.  Created
+     via open_shared_mutex: bare Win32 names are unreliable inside the
+     mxc ProcessContainer (forked children were denied at the keyed
+     route), the AppContainer-absolute route is shared by all
+     processes. */
+  if (!(mutex = open_shared_mutex (L"tty_list::mutex", 0)))
     api_fatal ("can't create tty_list::mutex '%s', %E", name);
   ProtectHandle (mutex);
 }

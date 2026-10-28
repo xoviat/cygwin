@@ -520,7 +520,8 @@ extern PSECURITY_DESCRIPTOR _recycler_sd (void *buf, bool users, bool dir);
 		 (dir)))
 
 extern PSECURITY_DESCRIPTOR _everyone_sd (void *buf, ACCESS_MASK access);
-#define everyone_sd(access)	(_everyone_sd (alloca (SD_MIN_SIZE), (access)))
+#define everyone_sd(access)	(_everyone_sd (alloca (sizeof (SECURITY_DESCRIPTOR) \
+						      + MAX_DACL_LEN (2)), (access)))
 
 #define sec_none_cloexec(f) (((f) & O_CLOEXEC ? &sec_none_nih : &sec_none))
 

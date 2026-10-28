@@ -1,0 +1,1094 @@
+diff --git a/winsup/cygwin/fhandler/pipe.cc b/winsup/cygwin/fhandler/pipe.cc
+index 2312688..1684005 100644
+--- a/winsup/cygwin/fhandler/pipe.cc
++++ b/winsup/cygwin/fhandler/pipe.cc
+@@ -71,6 +71,11 @@ fhandler_pipe::set_pipe_non_blocking (bool nonblocking)
+ int
+ fhandler_pipe::init (HANDLE f, DWORD a, mode_t mode, int64_t uniq_id)
+ {
++  /* In sandboxed fork children (mxc ProcessContainer) CreateProcess handle
++     inheritance delivers present-but-wrong handle values (ACCESS_DENIED on
++     write, WAIT_ABANDONED on the mutex).  Opt into fork_fixup so all pipe
++     handles are re-duplicated from the parent instead. */
++  need_fork_fixup (true);
+   /* FIXME: Have to clean this up someday
+      FIXME: Do we have to check for both !get_win32_name() and
+      !*get_win32_name()? */
+@@ -478,9 +483,20 @@ fhandler_pipe_fifo::raw_write (const void *ptr, size_t len)
+ 	  pthread::static_cancel_self ();
+ 	  /* NOTREACHED */
+ 	default:
+-	  /* Should not reach here. */
+-	  __seterrno ();
+-	  return -1;
++	  /* Should not reach here -- unless the inherited pipe_mtx handle is
++	     mangled (fork children under a sandboxing backend can get
++	     present-but-wrong inherited handles).  Re-create the mutex by
++	     name and continue writing. */
++	  {
++	    char name[MAX_PATH];
++	    const char *io = get_device () == FH_PIPER ? "input" : "output";
++	    pipe_mtx = CreateMutex (sec_none_cloexec (0), FALSE,
++				    get_mtx_name (get_handle (), io, name));
++	    if (pipe_mtx)
++	      break;
++	    __seterrno ();
++	    return -1;
++	  }
+ 	}
+     }
+   if (get_device () == FH_PIPEW && is_nonblocking ())
+@@ -971,7 +987,16 @@ int
+ fhandler_pipe::create (fhandler_pipe *fhs[2], unsigned psize, int mode)
+ {
+   HANDLE r, w;
+-  SECURITY_ATTRIBUTES *sa = sec_none_cloexec (mode);
++  /* PSEC-sandbox hardening: NULL DACLs (sec_none*) become restrictive DACLs
++     in the mxc ProcessContainer, which then denies forked children (pipeline
++     writes failed with ERROR_ACCESS_DENIED).  Use the user/confinement DACL
++     instead -- the same security the signal pipe uses (sec_user, dsh#10 fix
++     in sec_acl), proven to work for children. */
++  char sa_buf[1024];
++  SECURITY_ATTRIBUTES *sa = sec_user ((PSECURITY_ATTRIBUTES) sa_buf,
++				      cygheap->user.sid ());
++  if (mode & O_CLOEXEC)
++    sa->bInheritHandle = FALSE;
+   int res = -1;
+   int64_t unique_id = 0; /* Compiler complains if not initialized... */
+ 
+@@ -981,6 +1006,13 @@ fhandler_pipe::create (fhandler_pipe *fhs[2], unsigned psize, int mode)
+       __seterrno_from_nt_status (status);
+       goto out;
+     }
++  /* mxc/PSEC: handles are created non-inheritable (inheritable named-pipe
++     objects get broken in the container); flag them afterwards. */
++  if (sa->bInheritHandle)
++    {
++      SetHandleInformation (r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
++      SetHandleInformation (w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
++    }
+   if ((fhs[0] = (fhandler_pipe *) build_fh_dev (*piper_dev)) == NULL)
+     goto err_close_rw_handle;
+   if ((fhs[1] = (fhandler_pipe *) build_fh_dev (*pipew_dev)) == NULL)
+@@ -1044,9 +1076,12 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+   r = NULL;
+   w = NULL;
+ 
+-  status = fhandler_base::npfs_handle (npfsh);
+-  if (!NT_SUCCESS (status))
+-    return status;
++  /* mxc/PSEC: opening the NamedPipe root (for relative names) is denied
++     (0xC0000022) inside the container, and relative/Win32 \\.\pipe names get
++     routed into a namespace whose objects deny writes.  Use absolute NT
++     names (RootDirectory = NULL) instead -- proven to work in-container. */
++  status = STATUS_SUCCESS;
++  (void) npfsh;
+ 
+   /* Ensure that there is enough pipe buffer space for atomic writes.  */
+   if (!psize)
+@@ -1054,8 +1089,10 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+ 
+   UNICODE_STRING pipename;
+   WCHAR pipename_buf[MAX_PATH];
+-  size_t len = __small_swprintf (pipename_buf, L"%S-%u-",
+-				 &cygheap->installation_key,
++  /* mxc/PSEC: use the CreatePipe-anonymous name pattern.  Container handle
++     inheritance drops named-pipe handles with other names (probe G/J). */
++  size_t len = __small_swprintf (pipename_buf,
++				 L"\\Device\\NamedPipe\\pipe-%u-",
+ 				 GetCurrentProcessId ());
+ 
+   access = GENERIC_READ | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
+@@ -1071,7 +1108,10 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+     {
+       static volatile ULONG pipe_unique_id;
+       LONG id = InterlockedIncrement ((LONG *) &pipe_unique_id);
+-      __small_swprintf (pipename_buf + len, L"pipe-nt-%p", id);
++      /* mxc/PSEC: offset the suffix into the proven-good range (the
++         in-container pipe object for suffix -1 came back broken while
++         -9999/-12345 work; still diagnosing the exact matcher). */
++      __small_swprintf (pipename_buf + len, L"%u", (unsigned) (id + 10000));
+       if (unique_id)
+ 	*unique_id = ((int64_t) id << 32 | GetCurrentProcessId ());
+ 
+@@ -1081,9 +1121,12 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+ 
+       RtlInitUnicodeString (&pipename, pipename_buf);
+ 
++      /* mxc/PSEC: create WITHOUT OBJ_INHERIT (inheritable named-pipe
++	 objects get broken in the container); flag the handles for
++	 inheritance afterwards. */
+       InitializeObjectAttributes (&attr, &pipename,
+-				  sa_ptr->bInheritHandle ? OBJ_INHERIT : 0,
+-				  npfsh, sa_ptr->lpSecurityDescriptor);
++				  0,
++				  NULL, sa_ptr->lpSecurityDescriptor);
+ 
+       timeout.QuadPart = -500000;
+       /* Set FILE_SYNCHRONOUS_IO_NONALERT flag so that native
+@@ -1135,6 +1178,7 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+ 
+   debug_printf ("NtOpenFile: name %S", &pipename);
+ 
++
+   access = GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+   status = NtOpenFile (&w, access, &attr, &io, 0, 0);
+   if (!NT_SUCCESS (status))
+diff --git a/winsup/cygwin/local_includes/security.h b/winsup/cygwin/local_includes/security.h
+index b31edfe..372a779 100644
+--- a/winsup/cygwin/local_includes/security.h
++++ b/winsup/cygwin/local_includes/security.h
+@@ -520,7 +520,8 @@ extern PSECURITY_DESCRIPTOR _recycler_sd (void *buf, bool users, bool dir);
+ 		 (dir)))
+ 
+ extern PSECURITY_DESCRIPTOR _everyone_sd (void *buf, ACCESS_MASK access);
+-#define everyone_sd(access)	(_everyone_sd (alloca (SD_MIN_SIZE), (access)))
++#define everyone_sd(access)	(_everyone_sd (alloca (sizeof (SECURITY_DESCRIPTOR) \
++						      + MAX_DACL_LEN (2)), (access)))
+ 
+ #define sec_none_cloexec(f) (((f) & O_CLOEXEC ? &sec_none_nih : &sec_none))
+ 
+diff --git a/winsup/cygwin/local_includes/shared_info.h b/winsup/cygwin/local_includes/shared_info.h
+index 4316717..9afb4d6 100644
+--- a/winsup/cygwin/local_includes/shared_info.h
++++ b/winsup/cygwin/local_includes/shared_info.h
+@@ -89,6 +89,7 @@ HANDLE get_shared_parent_dir ();
+ HANDLE get_session_parent_dir ();
+ char *shared_name (char *, const char *, int);
+ WCHAR *shared_name (WCHAR *, const WCHAR *, int);
++HANDLE open_shared_mutex (const WCHAR *, int);
+ void *open_shared (const WCHAR *, int, HANDLE&, DWORD,
+ 		   shared_locations, PSECURITY_ATTRIBUTES = &sec_all,
+ 		   DWORD = FILE_MAP_READ | FILE_MAP_WRITE);
+diff --git a/winsup/cygwin/mm/shared.cc b/winsup/cygwin/mm/shared.cc
+index 7977df3..8fe73aa 100644
+--- a/winsup/cygwin/mm/shared.cc
++++ b/winsup/cygwin/mm/shared.cc
+@@ -23,14 +23,192 @@ details. */
+ #include "spinlock.h"
+ #include <alloca.h>
+ #include <wchar.h>
++#include "security.h"
+ 
+ shared_info NO_COPY *cygwin_shared;
+ user_info NO_COPY *user_shared;
+ HANDLE NO_COPY cygwin_shared_h;
+ HANDLE NO_COPY cygwin_user_h;
+ 
++/* AppContainer / restricted-sandbox support.
++
++   AppContainer processes (and sandbox backends that hand out AppContainer
++   tokens, such as MXC's ProcessContainer) cannot create objects in the
++   global \BaseNamedObjects namespace: Win32 named-object APIs are
++   redirected in user-mode (kernelbase!BaseGetNamedObjectDirectory) to
++   \Sessions\<session>\AppContainerNamedObjects\<package SID>, but absolute
++   NT paths passed to NtCreateDirectoryObject are not rewritten and fail
++   the DIRECTORY_CREATE_SUBDIRECTORY access check with STATUS_ACCESS_DENIED
++   (see microsoft/mxc#1061).  When the global namespace is not writable,
++   fall back to the container's own named-object namespace, keeping the
++   per-installation key as a subdirectory so multiple MSYS installations
++   sharing one container do not collide. */
++
++/* Cached per-installation key leaf name, e.g. "msys-2.0S5-<key>". */
++static WCHAR NO_COPY shared_key_name[128];
++
++static void
++build_shared_key_name ()
++{
++  if (!shared_key_name[0])
++    __small_swprintf (shared_key_name, L"%s%s-%S",
++		      cygwin_version.shared_id,
++		      _cygwin_testing ? cygwin_version.dll_build_date : "",
++		      &cygheap->installation_key);
++}
++
++/* Query the current session id. */
++static bool
++get_session_id (ULONG *id)
++{
++  PROCESS_SESSION_INFORMATION psi;
++  NTSTATUS status = NtQueryInformationProcess (NtCurrentProcess (),
++					      ProcessSessionInformation,
++					      &psi, sizeof psi, NULL);
++  if (!NT_SUCCESS (status))
++    return false;
++  *id = psi.SessionId;
++  return true;
++}
++
++/* Query the AppContainer package SID of the current process token via
++   ntdll.  ntdll is used deliberately: some sandboxes filter
++   kernelbase's QueryInformationToken for selected token classes while
++   the raw NT query still answers.  Returns false (and NO_SID) when the
++   process is not running under an AppContainer-like token. */
++static bool
++get_appcontainer_sid (cygsid &sid)
++{
++  static bool queried = false;
++  static cygsid cached_sid (NO_SID);
++
++  if (!queried)
++    {
++      HANDLE token = NULL;
++      ULONG size = 0;
++      queried = true;
++      if (NT_SUCCESS (NtOpenProcessToken (NtCurrentProcess (),
++					  TOKEN_QUERY, &token)))
++	{
++	  NTSTATUS status = NtQueryInformationToken (token,
++						    TokenAppContainerSid,
++						    NULL, 0, &size);
++	  if (status == STATUS_BUFFER_TOO_SMALL
++	      || status == STATUS_BUFFER_OVERFLOW)
++	    {
++	      PTOKEN_APPCONTAINER_INFORMATION pac =
++		  (PTOKEN_APPCONTAINER_INFORMATION) alloca (size);
++	      status = NtQueryInformationToken (token, TokenAppContainerSid,
++						pac, size, &size);
++	      if (NT_SUCCESS (status) && pac->TokenAppContainer)
++		cached_sid = pac->TokenAppContainer;
++	    }
++	  NtClose (token);
++	}
++    }
++  sid = cached_sid;
++  return PSID (sid) != NO_SID;
++}
++
++/* Open (or create) a directory object NAME relative to ROOT (or with an
++   absolute path when ROOT is NULL).  Returns the handle, or NULL with
++   *err set to the failing NTSTATUS. */
++static HANDLE
++open_shared_dir (PUNICODE_STRING name, HANDLE root, NTSTATUS *err,
++		 bool retry = false)
++{
++  OBJECT_ATTRIBUTES attr;
++  HANDLE dir = NULL;
++
++  InitializeObjectAttributes (&attr, name, OBJ_OPENIF, root,
++			      everyone_sd (CYG_SHARED_DIR_ACCESS));
++  for (int tries = 0;; tries++)
++    {
++      *err = NtCreateDirectoryObject (&dir, CYG_SHARED_DIR_ACCESS, &attr);
++      if (NT_SUCCESS (*err) || !retry || tries >= 100)
++	break;
++      /* Sandboxed environments (e.g. the Windows ProcessContainer) can
++	 make the named object namespace of a new process available
++	 slightly after it starts running.  A create at that instant
++	 fails transiently even though the same call succeeds
++	 milliseconds later.  Retry briefly before giving up. */
++      if (*err != STATUS_ACCESS_DENIED
++	  && *err != STATUS_OBJECT_NAME_NOT_FOUND
++	  && *err != STATUS_OBJECT_PATH_NOT_FOUND
++	  && *err != STATUS_OBJECT_NAME_COLLISION)
++	break;
++      Sleep (20);
++    }
++  return NT_SUCCESS (*err) ? dir : NULL;
++}
++
++/* The per-installation directory inside the AppContainer named-object
++   namespace
++   (\Sessions\<session>\AppContainerNamedObjects\<package SID>\<key>).
++   The container root directory is created by the kernel at AppContainer
++   process creation (verified writable from inside the container, with
++   CYG_SHARED_DIR_ACCESS).  Returns NULL and sets *err when the token has
++   no AppContainer SID or the directory cannot be opened/created. */
++static HANDLE
++get_appcontainer_parent_dir (NTSTATUS *err)
++{
++  static HANDLE NO_COPY ac_parent_dir;
++  static bool NO_COPY ac_tried = false;
++  cygsid sid (NO_SID);
++  ULONG session = 0;
++  WCHAR buf[MAX_PATH];
++  UNICODE_STRING uname;
++  HANDLE root = NULL;
++
++  *err = STATUS_UNSUCCESSFUL;
++  if (ac_tried)
++    return ac_parent_dir;
++  ac_tried = true;
++
++  if (!get_appcontainer_sid (sid))
++    {
++      *err = STATUS_NOT_FOUND;
++      return NULL;
++    }
++  if (!get_session_id (&session))
++    return NULL;
++  build_shared_key_name ();
++
++  {
++    UNICODE_STRING ac_sid;
++    NTSTATUS st = RtlConvertSidToUnicodeString (&ac_sid, sid, TRUE);
++    if (!NT_SUCCESS (st))
++      {
++	*err = st;
++	return NULL;
++      }
++    __small_swprintf (buf,
++		      L"\\Sessions\\%d\\AppContainerNamedObjects\\%S",
++		      session, &ac_sid);
++    RtlFreeUnicodeString (&ac_sid);
++  }
++
++  RtlInitUnicodeString (&uname, buf);
++  root = open_shared_dir (&uname, NULL, err, true);
++  if (!root)
++    return NULL;
++
++  {
++    UNICODE_STRING key;
++    RtlInitUnicodeString (&key, shared_key_name);
++    ac_parent_dir = open_shared_dir (&key, root, err, true);
++  }
++  NtClose (root);
++  return ac_parent_dir;
++}
++
+ /* This function returns a handle to the top-level directory in the global
+-   NT namespace used to implement global objects including shared memory. */
++   NT namespace used to implement global objects including shared memory.
++
++   When the process runs under a sandbox that denies write access to the
++   global namespace (AppContainer-based sandboxes such as MXC's
++   ProcessContainer), fall back to the container's named-object namespace
++   and then to the session namespaces before giving up. */
+ 
+ static HANDLE NO_COPY shared_parent_dir;
+ 
+@@ -39,22 +217,58 @@ get_shared_parent_dir ()
+ {
+   UNICODE_STRING uname;
+   OBJECT_ATTRIBUTES attr;
+-  NTSTATUS status;
++  NTSTATUS status, ac_status = STATUS_UNSUCCESSFUL;
++  NTSTATUS bnol_status = STATUS_UNSUCCESSFUL;
++  NTSTATUS sbno_status = STATUS_UNSUCCESSFUL;
+ 
+   if (!shared_parent_dir)
+     {
+       WCHAR bnoname[MAX_PATH];
+-      __small_swprintf (bnoname, L"\\BaseNamedObjects\\%s%s-%S",
+-			cygwin_version.shared_id,
+-			_cygwin_testing ? cygwin_version.dll_build_date : "",
+-			&cygheap->installation_key);
++      build_shared_key_name ();
++      __small_swprintf (bnoname, L"\\BaseNamedObjects\\%s", shared_key_name);
+       RtlInitUnicodeString (&uname, bnoname);
+       InitializeObjectAttributes (&attr, &uname, OBJ_OPENIF, NULL,
+ 				  everyone_sd (CYG_SHARED_DIR_ACCESS));
+       status = NtCreateDirectoryObject (&shared_parent_dir,
+ 					CYG_SHARED_DIR_ACCESS, &attr);
+       if (!NT_SUCCESS (status))
+-	api_fatal ("NtCreateDirectoryObject(%S): %y", &uname, status);
++	{
++	  /* The global namespace is not writable (sandboxed process).
++	     Use the AppContainer named-object namespace when the token
++	     has a package SID... */
++	  shared_parent_dir = get_appcontainer_parent_dir (&ac_status);
++	  if (!shared_parent_dir)
++	    {
++	      /* ... otherwise the per-session namespaces. */
++	      ULONG session = 0;
++	      if (get_session_id (&session) && session)
++		{
++		  __small_swprintf (bnoname,
++				    L"\\Sessions\\BNOLINKS\\%d\\%s",
++				    session, shared_key_name);
++		  RtlInitUnicodeString (&uname, bnoname);
++		  shared_parent_dir = open_shared_dir (&uname, NULL,
++						      &bnol_status);
++		  if (!shared_parent_dir)
++		    {
++		      __small_swprintf (bnoname,
++					L"\\Sessions\\%d\\"
++					L"BaseNamedObjects\\%s",
++					session, shared_key_name);
++		      RtlInitUnicodeString (&uname, bnoname);
++		      shared_parent_dir = open_shared_dir (&uname, NULL,
++							  &sbno_status);
++		    }
++		}
++	      if (!shared_parent_dir)
++		api_fatal ("NtCreateDirectoryObject"
++			   "(\\BaseNamedObjects\\%s): %y; "
++			   "AppContainer ns: %y; BNOLINKS: %y; "
++			   "session BNO: %y",
++			   shared_key_name, status, ac_status,
++			   bnol_status, sbno_status);
++	    }
++	}
+     }
+   return shared_parent_dir;
+ }
+@@ -79,18 +293,23 @@ get_session_parent_dir ()
+       else
+ 	{
+ 	  WCHAR bnoname[MAX_PATH];
++	  build_shared_key_name ();
+ 	  __small_swprintf (bnoname,
+-			    L"\\Sessions\\BNOLINKS\\%d\\%s%s-%S",
+-			    psi.SessionId, cygwin_version.shared_id,
+-			    _cygwin_testing ? cygwin_version.dll_build_date : "",
+-			    &cygheap->installation_key);
++			    L"\\Sessions\\BNOLINKS\\%d\\%s",
++			    psi.SessionId, shared_key_name);
+ 	  RtlInitUnicodeString (&uname, bnoname);
+ 	  InitializeObjectAttributes (&attr, &uname, OBJ_OPENIF, NULL,
+ 				      everyone_sd(CYG_SHARED_DIR_ACCESS));
+ 	  status = NtCreateDirectoryObject (&session_parent_dir,
+ 					    CYG_SHARED_DIR_ACCESS, &attr);
+ 	  if (!NT_SUCCESS (status))
+-	    api_fatal ("NtCreateDirectoryObject(%S): %y", &uname, status);
++	    /* Sandboxed process: the session namespace is not writable
++	       either.  Share the fallback chain used for the global
++	       parent dir (verified correct under MXC's ProcessContainer,
++	       where both \\Sessions\\BNOLINKS\\<n> and
++	       \\Sessions\\<n>\\BaseNamedObjects are denied but the
++	       AppContainer namespace is writable). */
++	    session_parent_dir = get_shared_parent_dir ();
+ 	}
+     }
+   return session_parent_dir;
+@@ -110,11 +329,184 @@ shared_name (WCHAR *ret_buf, const WCHAR *str, int num)
+   return ret_buf;
+ }
+ 
++
++/* Absolute NT path of NAME.N in the AppContainer namespace ROOT:
++   \Sessions\<session>\AppContainerNamedObjects\<package SID>\NAME.N
++   Win32 bare names are redirected elsewhere (per-installation-key
++   subdirectories once cygwin created those); under mxc's
++   ProcessContainer the sections then end up unopenable for sibling
++   processes.  Objects at the namespace root open fine everywhere
++   (verified in-container), and every cygwin process derives this exact
++   path from its own package SID + session id, so all processes agree.
++   Returns false when the token has no AppContainer SID (plain
++   Windows): callers then keep the stock Win32 behavior unchanged. */
++static bool
++ac_absolute_name (const WCHAR *name, int n, WCHAR *buf, size_t bufsz)
++{
++  cygsid pac_sid (NO_SID);
++  ULONG ac_session = 0;
++  UNICODE_STRING usid;
++  WCHAR leaf[MAX_PATH];
++
++  if (!name || !get_appcontainer_sid (pac_sid)
++      || !get_session_id (&ac_session))
++    return false;
++  if (!NT_SUCCESS (RtlConvertSidToUnicodeString (&usid, pac_sid, TRUE)))
++    return false;
++  __small_swprintf (buf, L"\\Sessions\\%d\\AppContainerNamedObjects\\%S",
++		    (int) ac_session, &usid);
++  RtlFreeUnicodeString (&usid);
++  shared_name (leaf, name, n);
++  if (wcslen (buf) + 1 + wcslen (leaf) + 1 > bufsz)
++    return false;
++  wcscat (buf, L"\\");
++  wcscat (buf, leaf);
++  return true;
++}
++
++static HANDLE
++nt_open_section_name (const WCHAR *path, DWORD access)
++{
++  UNICODE_STRING uname;
++  OBJECT_ATTRIBUTES attr;
++  HANDLE h = NULL;
++
++  RtlInitUnicodeString (&uname, path);
++  InitializeObjectAttributes (&attr, &uname, 0, NULL, NULL);
++  if (!NT_SUCCESS (NtOpenSection (&h, access | SECTION_QUERY, &attr)))
++    return NULL;
++  return h;
++}
++
++static NTSTATUS
++nt_create_section_name (const WCHAR *path, PSECURITY_ATTRIBUTES psa,
++			DWORD size, HANDLE *out, bool *existed)
++{
++  UNICODE_STRING uname;
++  OBJECT_ATTRIBUTES attr;
++  LARGE_INTEGER ms;
++  PSECURITY_DESCRIPTOR sd =
++    psa ? (PSECURITY_DESCRIPTOR) psa->lpSecurityDescriptor : NULL;
++  NTSTATUS st;
++
++  *existed = false;
++  *out = NULL;
++  RtlInitUnicodeString (&uname, path);
++  InitializeObjectAttributes (&attr, &uname, 0, NULL, sd);
++  ms.QuadPart = size;
++  st = NtCreateSection (out, SECTION_ALL_ACCESS, &attr, &ms,
++			PAGE_READWRITE, SEC_COMMIT, NULL);
++  if (st == STATUS_OBJECT_NAME_COLLISION || st == STATUS_OBJECT_NAME_EXISTS)
++    *existed = true;
++  else if (!NT_SUCCESS (st) && sd)
++    {
++      /* If some sandbox filters reject SD-bearing creates outright,
++	 retry once without a descriptor. */
++      *out = NULL;
++      InitializeObjectAttributes (&attr, &uname, 0, NULL, NULL);
++      st = NtCreateSection (out, SECTION_ALL_ACCESS, &attr, &ms,
++			    PAGE_READWRITE, SEC_COMMIT, NULL);
++      if (st == STATUS_OBJECT_NAME_COLLISION
++	  || st == STATUS_OBJECT_NAME_EXISTS)
++	*existed = true;
++    }
++  if (*existed)
++    {
++      /* The section is already there.  Some sandboxes report the
++	 collision without handing back a handle, so open it. */
++      *out = nt_open_section_name (path, FILE_MAP_ALL_ACCESS);
++      if (!*out)
++	return STATUS_ACCESS_DENIED;
++      return STATUS_SUCCESS;
++    }
++  return st;
++}
++
++/* Create or open the installation-wide named mutex NAME.N.
++
++   Bare Win32 object names are unreliable inside hardened sandboxes:
++   for msys processes they are routed into per-installation keyed
++   subdirectories, and creation/opening at that route was observed to
++   fail with ERROR_ACCESS_DENIED for freshly created (forked) processes
++   inside the mxc ProcessContainer while the identical call succeeds in
++   the parent (tty_list::mutex).  Inside an AppContainer use the
++   absolute namespace-root path instead -- the same addressing the
++   section objects use (see ac_absolute_name), which every cygwin
++   process derives identically, so all processes still share one mutex.
++   Without a package SID the stock CreateMutex call is kept unchanged.
++   Both paths retry the transient namespace-provisioning errors briefly
++   (same race as the open_shared create path). */
++HANDLE
++open_shared_mutex (const WCHAR *name, int n)
++{
++  WCHAR leaf[MAX_PATH];
++  WCHAR acname[MAX_PATH];
++  PSECURITY_DESCRIPTOR sd = everyone_sd (CYG_MUTANT_ACCESS);
++  bool ac = ac_absolute_name (name, n, acname,
++			      sizeof acname / sizeof (WCHAR));
++
++  shared_name (leaf, name, n);
++  for (int tries = 0;; tries++)
++    {
++      HANDLE h = NULL;
++      DWORD err = 0;
++
++      if (ac)
++	{
++	  UNICODE_STRING uname;
++	  OBJECT_ATTRIBUTES attr;
++	  NTSTATUS st;
++
++	  RtlInitUnicodeString (&uname, acname);
++	  InitializeObjectAttributes (&attr, &uname, 0, NULL, sd);
++	  st = NtCreateMutant (&h, CYG_MUTANT_ACCESS, &attr, FALSE);
++	  if (!NT_SUCCESS (st))
++	    {
++	      /* Some sandboxes reject SD-bearing creates outright;
++		 retry once without a descriptor. */
++	      h = NULL;
++	      InitializeObjectAttributes (&attr, &uname, 0, NULL, NULL);
++	      st = NtCreateMutant (&h, CYG_MUTANT_ACCESS, &attr, FALSE);
++	    }
++	  if (!NT_SUCCESS (st))
++	    {
++	      /* Collision without a handle (see nt_create_section_name):
++		 open the existing mutex explicitly. */
++	      h = NULL;
++	      InitializeObjectAttributes (&attr, &uname, 0, NULL, NULL);
++	      st = NtOpenMutant (&h, CYG_MUTANT_ACCESS, &attr);
++	    }
++	  if (!NT_SUCCESS (st))
++	    {
++	      h = NULL;
++	      err = RtlNtStatusToDosError (st);
++	    }
++	}
++      else
++	{
++	  h = CreateMutexW (&sec_all_nih, FALSE, leaf);
++	  if (!h)
++	    err = GetLastError ();
++	}
++      if (h)
++	return h;
++
++      bool transient = (err == ERROR_ACCESS_DENIED
++			|| err == ERROR_PATH_NOT_FOUND
++			|| err == ERROR_FILE_NOT_FOUND
++			|| err == ERROR_INVALID_NAME);
++      if (!transient || tries >= 150)
++	return NULL;
++      Sleep (20);
++    }
++}
++
+ #define page_const ((ptrdiff_t) 65535)
+ #define pround(n) ((ptrdiff_t)(((n) + page_const) & ~page_const))
+ 
+ static NO_COPY uintptr_t next_address = SHARED_REGIONS_ADDRESS_LOW;
+ 
++
+ void *
+ open_shared (const WCHAR *name, int n, HANDLE& shared_h, DWORD size,
+ 	     shared_locations m, PSECURITY_ATTRIBUTES psa, DWORD access)
+@@ -133,25 +525,148 @@ open_shared (const WCHAR *name, int n, HANDLE& shared_h, DWORD size,
+   void *shared;
+   void *addr;
+ 
++  /* Hardened sandboxes (e.g. the Windows ProcessContainer) silently
++     rewrite DACL-less sections: the object gets created, but with a
++     default DACL that then denies every sibling process (observed:
++     forked cygwin children fail on shared.5 with ERROR_ACCESS_DENIED
++     while fresh names in the same directory work fine, because the
++     parent's NULL-DACL object was rewritten).  Substitute an explicit
++     everyone-ACE descriptor, which survives rewriting -- the same
++     shape we already use for our named-object directories.  Without a
++     sandbox this only changes the SD from "no DACL" to "everybody
++     allowed", which is access-equivalent.  (Keep this block at
++     function scope: everyone_sd allocates its buffer on the stack.) */
++  SECURITY_ATTRIBUTES explicit_sa;
++  PSECURITY_DESCRIPTOR lsd =
++    psa ? (PSECURITY_DESCRIPTOR) psa->lpSecurityDescriptor : NULL;
++  BOOLEAN dacl_present = FALSE, dacl_defaulted = FALSE;
++  PACL dacl = NULL;
++  bool dacl_less = !lsd;
++  if (lsd
++      && NT_SUCCESS (RtlGetDaclSecurityDescriptor (lsd, &dacl_present,
++						   &dacl, &dacl_defaulted)))
++    dacl_less = dacl_present && !dacl;
++  if (dacl_less)
++    {
++      explicit_sa.nLength = sizeof (SECURITY_ATTRIBUTES);
++      explicit_sa.lpSecurityDescriptor = everyone_sd (FILE_MAP_ALL_ACCESS);
++      explicit_sa.bInheritHandle = FALSE;
++      psa = &explicit_sa;
++    }
++
++
+   created = false;
++  /* Remember whether the caller handed us an already open (typically
++     inherited) handle.  Such a borrowed value can be present in our
++     handle table and still be the wrong object for mapping in this
++     process: the classic fork emulation creates the child via
++     CreateProcess and passes the parent's cygwin_user_h value along
++     via child_proc_info, but hardened sandboxes (the Windows
++     ProcessContainer) don't preserve the handle table entry for it
++     (observed: MapViewOfFileEx fails with ERROR_INVALID_HANDLE
++     although GetHandleInformation reports the value as a valid
++     handle).  In that case drop the borrowed handle and redo the
++     create/open below by name. */
++  bool preset = shared_h != NULL;
++  /* Prefer the named path whenever a name is available: in sandboxed fork
++     children (mxc ProcessContainer) inherited handle values can be
++     present-but-reference the wrong object, and MapViewOfFileEx on such a
++     value can silently succeed on the wrong object.  The borrowed handle is
++     kept only as a fallback. */
++  HANDLE borrowed = shared_h;
++  if (preset && name != NULL)
++    shared_h = NULL;
++retry_borrowed_handle:
+   if (!shared_h)
+     {
+       if (name)
+ 	mapname = shared_name (map_buf, name, n);
++      /* AppContainer: use the absolute namespace-root path (see
++	 ac_absolute_name).  Without an AppContainer SID, ntname stays
++	 NULL and stock Win32 behavior is preserved. */
++      WCHAR ac_map_buf[MAX_PATH];
++      NTSTATUS nt_last_st = STATUS_SUCCESS;
++      WCHAR *ntname = NULL;
++      if (name && ac_absolute_name (name, n, ac_map_buf,
++				    sizeof ac_map_buf / sizeof (WCHAR)))
++	ntname = ac_map_buf;
+       if (m == SH_JUSTOPEN)
+-	shared_h = OpenFileMappingW (access, FALSE, mapname);
++	shared_h = ntname ? nt_open_section_name (ntname, access)
++			  : OpenFileMappingW (access, FALSE, mapname);
+       else
+ 	{
+ 	  created = true;
+-	  shared_h = CreateFileMappingW (INVALID_HANDLE_VALUE, psa,
+-					PAGE_READWRITE, 0, size, mapname);
+-	  if (GetLastError () == ERROR_ALREADY_EXISTS)
++	  /* See the DACL-less substitution at function top. */
++	  /* Sandboxed environments (e.g. the Windows ProcessContainer) can
++	     make the named object namespace of a newly created process
++	     available slightly after it starts running.  A create at that
++	     instant fails with ACCESS_DENIED/PATH_NOT_FOUND even though
++	     the very same call succeeds milliseconds later (observed for
++	     nested processes in the mxc ProcessContainer, where every
++	     forked cygwin child would otherwise die here).  Retry
++	     transient failures briefly before treating them as fatal. */
++	  for (int tries = 0;; tries++)
++	    {
++	      NTSTATUS st = STATUS_SUCCESS;
++	      if (ntname)
++		{
++		  bool existed = false;
++		  st = nt_create_section_name (ntname, psa, size,
++					       &shared_h, &existed);
++		  nt_last_st = st;
++		  if (NT_SUCCESS (st))
++		    {
++		      if (existed)
++			created = false;
++		      break;
++		    }
++		}
++	      else
++		{
++		  shared_h = CreateFileMappingW (INVALID_HANDLE_VALUE, psa,
++						PAGE_READWRITE, 0, size,
++						mapname);
++		  if (shared_h)
++		    break;
++		}
++	      bool transient;
++	      if (ntname)
++		transient = (st == STATUS_ACCESS_DENIED
++			     || st == STATUS_OBJECT_NAME_NOT_FOUND
++			     || st == STATUS_OBJECT_PATH_NOT_FOUND
++			     || st == STATUS_OBJECT_NAME_INVALID);
++	      else
++		{
++		  DWORD err = GetLastError ();
++		  transient = (err == ERROR_ACCESS_DENIED
++			       || err == ERROR_PATH_NOT_FOUND
++			       || err == ERROR_FILE_NOT_FOUND
++			       || err == ERROR_INVALID_NAME);
++		}
++	      if (!transient || tries >= 150)
++		{
++		  if (ntname && !NT_SUCCESS (nt_last_st))
++		    SetLastError (RtlNtStatusToDosError (nt_last_st));
++		  break;
++		}
++	      Sleep (20);
++	    }
++	  if (!ntname && shared_h && GetLastError () == ERROR_ALREADY_EXISTS)
+ 	    created = false;
+ 	}
+       if (shared_h)
+ 	/* ok! */;
++      else if (preset && borrowed)
++	{
++	  /* Named path failed; fall back to the borrowed handle value. */
++	  shared_h = borrowed;
++	  preset = false;
++	  created = false;
++	  goto retry_borrowed_handle;
++	}
+       else if (m != SH_JUSTOPEN)
+-	api_fatal ("CreateFileMapping %W, %E.  Terminating.", mapname);
++	api_fatal ("CreateFileMapping %W, %E.  Terminating.",
++		   ntname ? ntname : mapname);
+       else
+ 	return NULL;
+     }
+@@ -174,11 +689,27 @@ open_shared (const WCHAR *name, int n, HANDLE& shared_h, DWORD size,
+ 	  loop = true;
+ 	}
+     }
+-  while (!shared);
++  /* ERROR_INVALID_HANDLE means the handle value itself is unusable;
++     retrying other addresses cannot help. */
++  while (shared == NULL && GetLastError () != ERROR_INVALID_HANDLE);
+ 
+   if (!shared)
++    {
++      if (preset && borrowed)
++        {
++          /* Named mapping failed; try the borrowed handle value once. */
++          preset = false;
++          shared_h = borrowed;
++          created = false;
++          goto retry_borrowed_handle;
++        }
++    }
++
++  if (!shared)
++    {
+     api_fatal ("MapViewOfFileEx '%W'(%p, size %u, m %d, created %d), %E.  "
+ 	       "Terminating.", mapname, shared_h, size, m, created);
++    }
+ 
+   debug_printf ("name %W, shared %p (wanted %p), h %p, m %d, created %d",
+ 		mapname, shared, addr, shared_h, m, created);
+@@ -231,8 +762,11 @@ user_info::create (bool reinit)
+       cygwin_user_h = NULL;
+     }
+ 
+-  if (!cygwin_user_h)
+-    cygheap->user.get_windows_id (name);
++  /* Always derive the name, even when an apparently usable handle was
++     inherited: if the borrowed handle turns out to be unmappable (see
++     the retry in open_shared), the section has to be re-opened by
++     name, and the caller must have supplied it. */
++  cygheap->user.get_windows_id (name);
+ 
+   user_shared = (user_info *) open_shared (name, USER_VERSION,
+ 					   cygwin_user_h, sizeof (user_info),
+diff --git a/winsup/cygwin/sec/helper.cc b/winsup/cygwin/sec/helper.cc
+index 89090fc..63aeaab 100644
+--- a/winsup/cygwin/sec/helper.cc
++++ b/winsup/cygwin/sec/helper.cc
+@@ -24,6 +24,7 @@ details. */
+ #include "cygheap.h"
+ #include "ntdll.h"
+ #include "ldap.h"
++#include "tls_pbuf.h"
+ 
+ /* General purpose security attribute objects for global use. */
+ static NO_COPY_RO SECURITY_DESCRIPTOR null_sdp =
+@@ -543,11 +544,107 @@ set_cygwin_privileges (HANDLE token)
+ #endif
+ }
+ 
++/* Cached identities of a confined (sandboxed) process token.  Both are
++   NO_SID for a normal, unrestricted token. */
++static cygsid confined_logon_sid (NO_SID);
++static cygsid confined_appcontainer_sid (NO_SID);
++static NO_COPY bool confined_sids_queried = false;
++
++/* Query the current process token for the identities a sandbox backend
++   presents when it opens a named object owned by the MSYS runtime:
++
++   - confined_logon_sid: the token's logon SID (SE_GROUP_LOGON_ID).  A
++     restricted token (CreateRestrictedToken, used by sandbox backends that
++     do not use an AppContainer) keeps the logon SID enabled even when the
++     user SID has been turned into a deny-only group, so it is the identity
++     such a confined client reliably presents.  See dsh-win-gitbash#10:
++     without it, MSYS's signal pipe self-connect fails with Win32 error 5.
++
++   - confined_appcontainer_sid: the AppContainer package SID
++     (TokenAppContainerSid).  This is the SID Windows uses to scope
++     AppContainer named objects (the
++     \Sessions\<n>\AppContainerNamedObjects\<SID> namespace).  See
++     microsoft/mxc#1061. */
++static void
++query_confined_sids ()
++{
++  NTSTATUS status;
++  ULONG size;
++  HANDLE token = NULL;
++  PTOKEN_GROUPS groups;
++  tmp_pathbuf tp;
++
++  if (confined_sids_queried)
++    return;
++  confined_sids_queried = true;
++
++  status = NtOpenProcessToken (NtCurrentProcess (), TOKEN_QUERY, &token);
++  if (!NT_SUCCESS (status))
++    {
++      debug_printf ("NtOpenProcessToken: %y", status);
++      return;
++    }
++
++  /* Logon SID: always enabled, even in a restricted token where the user
++     SID is deny-only.  Guarded only by SE_GROUP_LOGON_ID and by not being
++     deny-only itself; TokenGroups is universally queryable. */
++  groups = (PTOKEN_GROUPS) tp.w_get ();
++  status = NtQueryInformationToken (token, TokenGroups, groups,
++				    2 * NT_MAX_PATH, &size);
++  if (NT_SUCCESS (status))
++    {
++      for (DWORD pg = 0; pg < groups->GroupCount; ++pg)
++	if ((groups->Groups[pg].Attributes & SE_GROUP_LOGON_ID)
++	    && !(groups->Groups[pg].Attributes & SE_GROUP_USE_FOR_DENY_ONLY))
++	  {
++	    confined_logon_sid = groups->Groups[pg].Sid;
++	    break;
++	  }
++    }
++  else
++    debug_printf ("NtQueryInformationToken(TokenGroups) %y", status);
++
++  /* AppContainer package SID.  Deliberately NOT gated on the
++     TokenIsAppContainer boolean: some sandboxes (MXC's ProcessContainer)
++     refuse that query with ERROR_NOACCESS while TokenAppContainerSid
++     itself answers.  The package SID is the identity such a container
++     presents when opening a named object -- granting it on the runtime's
++     private pipes is what makes MSYS's signal-pipe self-connect succeed
++     inside the container (microsoft/mxc#1061, dsh-win-gitbash#10). */
++  {
++    PTOKEN_APPCONTAINER_INFORMATION pac =
++	(PTOKEN_APPCONTAINER_INFORMATION) tp.w_get ();
++
++    status = NtQueryInformationToken (token, TokenAppContainerSid, pac,
++				      2 * NT_MAX_PATH, &size);
++    if (NT_SUCCESS (status) && pac->TokenAppContainer)
++      confined_appcontainer_sid = pac->TokenAppContainer;
++  }
++
++  NtClose (token);
++}
++
++/* Append a GENERIC_ALL allow ACE for SID to the given DACL.  Silently
++   skips a NULL SID and ignores (but logs) failures, matching the existing
++   sec_acl () error handling: an over-full DACL degrades gracefully rather
++   than aborting the process. */
++static void
++sec_acl_add_sid (PACL acl, PSID sid, const char *what)
++{
++  NTSTATUS status;
++
++  if (!sid)
++    return;
++  status = RtlAddAccessAllowedAce (acl, ACL_REVISION, GENERIC_ALL, sid);
++  if (!NT_SUCCESS (status))
++    debug_printf ("RtlAddAccessAllowedAce(%s) %y", what, status);
++}
++
+ bool
+ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD access2)
+ {
+   NTSTATUS status;
+-  size_t acl_len = MAX_DACL_LEN (5);
++  size_t acl_len = MAX_DACL_LEN (7);
+   LPVOID pAce;
+   cygpsid psid;
+ 
+@@ -561,6 +658,7 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
+       debug_printf ("RtlCreateAcl: %y", status);
+       return false;
+     }
++  query_confined_sids ();
+   if (sid1)
+     {
+       status = RtlAddAccessAllowedAce (acl, ACL_REVISION, GENERIC_ALL, sid1);
+@@ -591,6 +689,19 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
+ 				   well_known_system_sid);
+   if (!NT_SUCCESS (status))
+     debug_printf ("RtlAddAccessAllowedAce(system) %y", status);
++  /* A sandboxed process (MSYS2/Cygwin under the MXC ProcessContainer or a
++     restricted token) presents an identity the static DACL above does not
++     cover: an AppContainer client authenticates via its package SID, and a
++     restricted token may carry the user SID only as a deny-only group, so a
++     user/admin/System DACL denies the client's self-connect (e.g. MSYS's
++     signal pipe, "couldn't create signal pipe, Win32 error 5").  Grant the
++     AppContainer package SID when present; it is per-container, so nothing
++     outside the sandbox gains access.  Note the mandatory (integrity) label
++     on the object still applies, so a Medium-labelled object remains
++     unreachable from a Low-IL client -- only the DACL mismatch is fixed
++     here. */
++  sec_acl_add_sid (acl, confined_appcontainer_sid, "appcontainer");
++  sec_acl_add_sid (acl, confined_logon_sid, "logon");
+   status = RtlFirstFreeAce (acl, &pAce);
+   if (NT_SUCCESS (status) && pAce)
+     acl->AclSize = (char *) pAce - (char *) acl;
+@@ -693,7 +804,7 @@ _everyone_sd (void *buf, ACCESS_MASK access)
+     {
+       RtlCreateSecurityDescriptor (psd, SECURITY_DESCRIPTOR_REVISION);
+       PACL dacl = (PACL) (psd + 1);
+-      RtlCreateAcl (dacl, MAX_DACL_LEN (1), ACL_REVISION);
++      RtlCreateAcl (dacl, MAX_DACL_LEN (2), ACL_REVISION);
+       status = RtlAddAccessAllowedAce (dacl, ACL_REVISION, access,
+ 				       well_known_world_sid);
+       if (!NT_SUCCESS (status))
+@@ -701,6 +812,24 @@ _everyone_sd (void *buf, ACCESS_MASK access)
+ 	  debug_printf ("RtlAddAccessAllowedAce: %y", status);
+ 	  return NULL;
+ 	}
++      /* ALL APPLICATION PACKAGES (S-1-15-2-1).  AppContainer processes
++	 are NOT covered by "Everyone" (S-1-1-0); without this ACE every
++	 object open from inside the container is denied (STATUS_ACCESS_DENIED,
++	 0xC0000022) -- e.g. the winpid.<N> symlink lookup that forks depend
++	 on (mxc#1061 / dsh-win-gitbash#10). */
++      {
++	SID apppkg;
++	SID_IDENTIFIER_AUTHORITY appauth = { { 0, 0, 0, 0, 0, 15 } };
++	if (NT_SUCCESS (RtlInitializeSid (&apppkg, &appauth, 2)))
++	  {
++	    *RtlSubAuthoritySid (&apppkg, 0) = 2; /* SECURITY_APP_PACKAGE_BASE_RID */
++	    *RtlSubAuthoritySid (&apppkg, 1) = 1; /* ALL APPLICATION PACKAGES */
++	    status = RtlAddAccessAllowedAce (dacl, ACL_REVISION, access,
++					     &apppkg);
++	    if (!NT_SUCCESS (status))
++	      debug_printf ("RtlAddAccessAllowedAce(app pkg): %y", status);
++	  }
++      }
+       LPVOID ace;
+       status = RtlFirstFreeAce (dacl, &ace);
+       if (!NT_SUCCESS (status))
+diff --git a/winsup/cygwin/syscalls.cc b/winsup/cygwin/syscalls.cc
+index 5ca02c0..7671e9d 100644
+--- a/winsup/cygwin/syscalls.cc
++++ b/winsup/cygwin/syscalls.cc
+@@ -3661,7 +3661,7 @@ seteuid (uid_t uid)
+ 	debug_printf ("NtSetInformationToken (user.token, TokenPrimaryGroup),"
+ 		      "%y", status);
+       /* Try setting default DACL */
+-      PACL dacl_buf = (PACL) alloca (MAX_DACL_LEN (5));
++      PACL dacl_buf = (PACL) alloca (MAX_DACL_LEN (7));
+       if (sec_acl (dacl_buf, true, true, usersid))
+ 	{
+ 	  TOKEN_DEFAULT_DACL tdacl = { dacl_buf };
+diff --git a/winsup/cygwin/tty.cc b/winsup/cygwin/tty.cc
+index ba65aca..786063f 100644
+--- a/winsup/cygwin/tty.cc
++++ b/winsup/cygwin/tty.cc
+@@ -70,8 +70,12 @@ tty_list::init_session ()
+   char mutex_name[MAX_PATH];
+   char *name = shared_name (mutex_name, "tty_list::mutex", 0);
+ 
+-  /* tty_list::mutex is used while searching for a tty slot */
+-  if (!(mutex = CreateMutex (&sec_all_nih, FALSE, name)))
++  /* tty_list::mutex is used while searching for a tty slot.  Created
++     via open_shared_mutex: bare Win32 names are unreliable inside the
++     mxc ProcessContainer (forked children were denied at the keyed
++     route), the AppContainer-absolute route is shared by all
++     processes. */
++  if (!(mutex = open_shared_mutex (L"tty_list::mutex", 0)))
+     api_fatal ("can't create tty_list::mutex '%s', %E", name);
+   ProtectHandle (mutex);
+ }
+diff --git a/winsup/cygwin/wincap.cc b/winsup/cygwin/wincap.cc
+index f94b9f6..477d212 100644
+--- a/winsup/cygwin/wincap.cc
++++ b/winsup/cygwin/wincap.cc
+@@ -282,14 +282,35 @@ wincapc wincap __attribute__((section (".cygwin_dll_common"), shared));
+ extern IMAGE_DOS_HEADER
+ __image_base__;
+ 
++/* True when P points into THIS process' instance of the runtime DLL.
++   The .cygwin_dll_common section survives fork/exec, so an exec'd child
++   inherits the parent's `caps` value, which points into the PARENT'S
++   image.  When this DLL instance is mapped at a different base (ASLR,
++   or sandboxes that force image relocation such as MXC's
++   ProcessContainer), that inherited pointer dangles and the first
++   capability query faults (microsoft/mxc#1061 follow-up).  Only trust an
++   inherited `caps` when it lands inside our own image. */
++static bool
++in_this_image (const void *p)
++{
++  MEMORY_BASIC_INFORMATION mbi_base, mbi_p;
++  if (!VirtualQuery (&__image_base__, &mbi_base, sizeof mbi_base))
++    return false;
++  if (!VirtualQuery (p, &mbi_p, sizeof mbi_p))
++    return false;
++  /* Same allocation block == same instance of this DLL, even when this
++   * instance is mapped at a relocated base. */
++  return mbi_p.AllocationBase == mbi_base.AllocationBase;
++}
++
+ void
+ wincapc::init ()
+ {
+   PIMAGE_NT_HEADERS ntheader;
+   USHORT emul_mach;
+-
+-  if (caps)
+-    return;		// already initialized
++  if (caps && in_this_image (caps))
++    return;		// already initialized for THIS image
++  caps = NULL;
+ 
+   GetSystemInfo (&system_info);
+   version.dwOSVersionInfoSize = sizeof (RTL_OSVERSIONINFOEXW);

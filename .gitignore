@@ -46,3 +46,26 @@ core
 !core/
 
 lost+found
+
+# --- mxc branch: tooling scratch, build trees, vendored trees --------
+pig-tmp*
+https%3a*
+winsup/_b/
+tools/msys2-runtime/
+tools/msys2/
+tools/git-priv/
+tools/mxc/
+tools/run/
+tools/probe/
+tools/cygwin/
+tools/cygwin-setup.exe
+tools/final-verify-out.txt
+
+# the runtime patch ships with the CI tooling despite the *.patch rule above
+!tools/ci/*.patch
+
+# patch round-trip test worktrees (scratch)
+tools/msys-clean/
+tools/msys-ci-test/
+tools/git-fresh/
+issue*.md

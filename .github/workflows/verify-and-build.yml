@@ -1,0 +1,204 @@
+name: verify-and-build
+
+# Verifies the goal (git-bash runs inside the mxc ProcessContainer) using the
+# fixes in this repository's winsup/ tree, then builds the runtime DLLs for
+# both trees.  On tag pushes the DLLs are attached to the GitHub release.
+#
+# Chain: cygwin-tree winsup fixes -> tools/ci/cygwin-winsup.patch ->
+#        tools/ci/apply-to-msys.sh -> msys-2.0.dll -> tools/final-verify.sh.
+#        The same winsup fixes build cygwin1.dll directly.
+
+on:
+  push:
+    branches: [mxc]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MSYS2_RUNTIME_REF: 710e5275eb86d54b45b5f4d71ecc4e1cac1b9302
+  MXC_REF: 05a430bc17a3e1b3fa2131524fc52e4319e07298
+
+jobs:
+  verify:
+    name: "verify: git-bash in the mxc sandbox"
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            experimental: false
+          # The only client-SKU hosted image (the ProcessContainer needs
+          # PSEC, which Server images do not enable).  x64 binaries run
+          # under emulation; experimental until proven.
+          - os: windows-11-arm
+            experimental: true
+    steps:
+      - name: Checkout cygwin tree (patch source)
+        uses: actions/checkout@v7
+
+      - name: MSYS2 build environment
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          install: >-
+            msys2-devel base-devel autotools cocom diffutils gcc
+            gettext-devel libiconv-devel make mingw-w64-cross-crt
+            mingw-w64-cross-gcc mingw-w64-cross-zlib perl zlib-devel
+            xmlto docbook-xsl libzstd-devel
+
+      - name: Checkout msys2-runtime (pinned)
+        uses: actions/checkout@v7
+        with:
+          repository: git-for-windows/msys2-runtime
+          ref: ${{ env.MSYS2_RUNTIME_REF }}
+          path: msys2-runtime
+
+      - name: Transfer the cygwin-tree patch to msys2-runtime
+        shell: bash
+        run: tools/ci/apply-to-msys.sh msys2-runtime
+
+      - name: Build msys-2.0.dll
+        shell: msys2 {0}
+        run: bash tools/ci/build-runtime-dll.sh msys2-runtime new-msys-2.0.dll
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Checkout mxc SDK (pinned)
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/mxc
+          ref: ${{ env.MXC_REF }}
+          path: mxc-src
+
+      - name: Build the git-bash runner example
+        shell: bash
+        run: |
+          cp tools/ci/mxc_gitbash_run.rs mxc-src/src/mxc-sdk/examples/
+          cargo build --example mxc_gitbash_run \
+            --manifest-path mxc-src/src/mxc-sdk/Cargo.toml
+          mkdir -p tools/run
+          cp mxc-src/src/target/debug/examples/mxc_gitbash_run.exe tools/run/
+
+      # The gate only reads the copy; the runner's real Git is never touched.
+      - name: Private Git copy
+        shell: bash
+        run: |
+          robocopy "C:\\Program Files\\Git" tools/git-priv //E //NFL //NDL //NJH //NJS || true
+
+      - name: Run the goal-verification gate
+        shell: bash
+        run: |
+          export MSYS_DLL="$(find "$PWD/msys2-runtime/build" -name 'new-msys-2.0.dll' | head -1)"
+          echo "MSYS_DLL=$MSYS_DLL"
+          if [ -z "$MSYS_DLL" ]; then
+            echo "::error::built DLL not found; DLLs present:"
+            find "$PWD/msys2-runtime" -name '*.dll' | head -20
+            exit 1
+          fi
+          bash tools/final-verify.sh
+
+      - name: Stage the verified msys DLL
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p msys-dll-out
+          find "$PWD/msys2-runtime/build" -name 'new-msys-2.0.dll' \
+            -exec cp {} msys-dll-out/msys-2.0.dll \;
+          ls -la msys-dll-out/
+
+      - name: Upload the verified msys DLL
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: msys-dll
+          path: msys-dll-out/msys-2.0.dll
+          if-no-files-found: error
+
+  build-dlls:
+    name: build cygwin1.dll + package both
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - name: Checkout cygwin tree
+        uses: actions/checkout@v7
+
+      - name: MSYS2 build environment
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          install: >-
+            msys2-devel base-devel autotools cocom diffutils gcc
+            gettext-devel libiconv-devel make mingw-w64-cross-crt
+            mingw-w64-cross-gcc mingw-w64-cross-zlib perl zlib-devel
+            xmlto docbook-xsl libzstd-devel
+
+      - name: Build cygwin1.dll from winsup
+        shell: msys2 {0}
+        run: bash tools/ci/build-runtime-dll.sh . new-cygwin1.dll --disable-doc
+
+      - name: Collect DLLs
+        shell: bash
+        run: |
+          mkdir -p dlls
+          find build \( -name 'new-cygwin1.dll' -o -name 'cygwin1.dll' \) \
+            -exec cp {} dlls/ \;
+          ls dlls/ | grep -qi cygwin1.dll
+
+      - name: Fetch the verified msys DLL
+        uses: actions/download-artifact@v7
+        with:
+          name: msys-dll
+          path: dlls
+
+      # PSEC force-relocates non-ASLR-opted-in images; the runtime must opt in
+      # (tools/final-verify.sh enforces the same for its own deploy).
+      - name: PE ASLR opt-in + package
+        shell: bash
+        run: |
+          # Artifacts may nest their paths; flatten before packaging.
+          find dlls -mindepth 2 -name '*.dll' -exec mv {} dlls/ \;
+          python tools/ci/peflag.py set dlls/*.dll
+          cp dlls/new-cygwin1.dll dlls/cygwin1.dll 2>/dev/null || true
+          cp dlls/new-msys-2.0.dll dlls/msys-2.0.dll 2>/dev/null || true
+          ls -la dlls/
+          test -f dlls/cygwin1.dll
+          test -f dlls/msys-2.0.dll
+
+      - name: Upload runtime DLLs
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-dlls
+          path: dlls/
+          if-no-files-found: error
+
+  release:
+    name: attach DLLs to the tag's release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-dlls
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch runtime DLLs
+        uses: actions/download-artifact@v7
+        with:
+          name: runtime-dlls
+          path: dlls
+
+      # Creates the GitHub release for the tag if it does not exist yet.
+      # Fallback if this ever fails: the workflow artifacts above remain
+      # downloadable from every run.
+      - name: Publish to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dlls/*
+          generate_release_notes: true

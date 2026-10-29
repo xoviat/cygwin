@@ -169,6 +169,7 @@ jobs:
           python tools/ci/peflag.py set dlls/*.dll
           cp dlls/new-cygwin1.dll dlls/cygwin1.dll 2>/dev/null || true
           cp dlls/new-msys-2.0.dll dlls/msys-2.0.dll 2>/dev/null || true
+          cp tools/ci/install.ps1 tools/ci/uninstall.ps1 dlls/
           ls -la dlls/
           test -f dlls/cygwin1.dll
           test -f dlls/msys-2.0.dll

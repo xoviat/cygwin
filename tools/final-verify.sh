@@ -1,5 +1,7 @@
 #!/bin/bash
-# End-to-end verification chain for the mxc#1061 + dsh#10 runtime fix.
+# End-to-end verification chain for the mxc#1061 + dsh#10 runtime fix,
+# including the residual fork-failure scenario (FORK_FAILURES.md) that the
+# fork-churn step keeps covered.
 # Prereqs: msys2-runtime built with tools/ci/cygwin-winsup.patch applied
 #          (tools/ci/apply-to-msys.sh); MSYS_DLL overrides the DLL location,
 #          mxc_gitbash_run built with ui.disable=false (mxc#1061 config).
@@ -100,6 +102,78 @@ step "mxc run: multi-command job control (compound script)"
 OUT=$(./mxc_gitbash_run.exe "\"$QPRIV\" -c 'for i in 1 2 3; do echo n=\$i; done; test -d /c/Windows && echo COMPOUND_OK'" 2>&1)
 echo "$OUT" | grep -A4 "stdout" | head -5
 echo "$OUT" | get_stdout | grep -q "COMPOUND_OK" && ok "compound script inside mxc sandbox" || bad "compound script inside mxc"
+
+# 4. The residual fork-failure scenario (FORK_FAILURES.md, tools/repro-fork):
+# sustained fork churn in one long-lived bash.  Before the runtime retry
+# fix this failed 5/5 rounds at n=500 (6/6 at n=100) with the verbatim
+# child_copy/dofork/0xC0000142 signature -- and a handful of lucky forks
+# (the steps above) still passed, so only churn catches it.  Classification
+# is on the signatures plus the workload's own integrity markers, not on
+# the runner's exit code alone.  CHURN_N scales the load (forks ~ 8*N).
+step "mxc run: sustained fork churn (residual fork-failure scenario)"
+CHURN_N="${CHURN_N:-100}"
+CHURN_SH="$(cygpath -u "${TEMP:-/tmp}")/mxc-churn-forks.sh"
+cat > "$CHURN_SH" <<'CHURN_EOF'
+# Runs under git-bash inside the mxc ProcessContainer.  Every pipeline,
+# command substitution and script exec is a fork of this long-lived parent.
+set -u
+N="$CHURN_N"
+FAILS=0
+fail() { echo "$1"; FAILS=$((FAILS + 1)); }
+OUT=/tmp
+mkdir -p "$OUT" 2>/dev/null
+# pipelines
+i=0; while [ $i -lt "$N" ]; do echo x | cat > /dev/null || fail "pipeline fork"; i=$((i + 1)); done
+echo "churn A done"
+# two-stage chained pipelines must not lose either stage
+printf 'PROTOCOL_VERSION=1\n2025-01-01\n' > "$OUT/pb.txt"
+i=0; while [ $i -lt $((N / 10 + 1)) ]; do
+  a=$(grep -o 'PROTOCOL_VERSION=[^ ]*' "$OUT/pb.txt" | head -3; true)
+  b=$(grep -o '2025-[^ ]*' "$OUT/pb.txt" | head -3; true)
+  case "$a" in *PROTOCOL_VERSION=1*) ;; *) fail "chained pipeline lost stage 1";; esac
+  case "$b" in *2025-01-01*) ;; *) fail "chained pipeline lost stage 2";; esac
+  i=$((i + 1)); done
+echo "churn B done"
+# heredoc integrity: content must survive the fork
+rm -f "$OUT/heredoc.txt"
+i=0; while [ $i -lt 20 ]; do
+  cat >> "$OUT/heredoc.txt" <<EOF
+line-one-$i
+line-two-$i
+EOF
+  i=$((i + 1)); done
+got=$(grep -c 'line-' "$OUT/heredoc.txt" 2>/dev/null || echo 0)
+[ "$got" = 40 ] || fail "heredoc lost content (got $got/40)"
+echo "churn C done"
+# command substitution
+i=0; while [ $i -lt $((N / 5 + 1)) ]; do
+  v=$({ echo hi | tr a-z A-Z; }); [ "$v" = "HI" ] || fail "cmdsub lost output"; i=$((i + 1)); done
+echo "churn D done"
+# concurrent fork load: 3 subshells racing the cygheap copy
+for j in 1 2 3; do
+  ( i=0; while [ $i -lt $((N / 10 + 1)) ]; do echo c | cat > /dev/null || exit 1; i=$((i + 1)); done ) &
+done
+wait || fail "concurrent fork load"
+echo "churn E done"
+echo "CHURN_OK fails=$FAILS"
+exit "$FAILS"
+CHURN_EOF
+# Bake N in without risking quoting through the runner's command line.
+sed -i "s|^N=\"\$CHURN_N\"|N=$CHURN_N|" "$CHURN_SH"
+CHURN_WIN=$(cygpath -m "$CHURN_SH")
+export MXC_RUN_TIMEOUT_MS="${MXC_RUN_TIMEOUT_MS:-300000}"
+OUT=$(./mxc_gitbash_run.exe "\"$QPRIV\" \"$CHURN_WIN\"" 2>&1)
+echo "$OUT" | get_stdout | tail -8
+# Fork-failure signatures from FORK_FAILURES.md plus the runtime's loud
+# end-of-retry diagnostics.  Any of these means the scenario reproduced,
+# even if the workload managed to limp through.
+echo "$OUT" | grep -v '^command:' \
+  | grep -E 'child_copy:|dofork:|copy failed|VirtualAlloc|Resource temporarily unavailable|0xC0000142|-1073741502' \
+  && bad "fork-churn signatures present" || ok "no fork-failure signatures"
+echo "$OUT" | get_stdout | grep -q "CHURN_OK fails=0" \
+  && ok "fork churn workload intact (heredoc/pipelines/cmdsub)" \
+  || bad "fork churn workload lost data"
+echo "$OUT" | grep -q "Exited(0)" && ok "fork churn exit 0" || bad "fork churn exit code"
 
 step "mxc controls (informational)"
 OUT=$(./mxc_gitbash_run.exe 'C:\Windows\System32\cmd.exe /c ver' 2>&1)

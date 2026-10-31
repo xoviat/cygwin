@@ -35,6 +35,15 @@ enum child_status
 /* Change this value if you get a message indicating that it is out-of-sync. */
 #define CURR_CHILD_INFO_MAGIC 0x1052d96bU
 
+/* Default retry budget for transient child-init failures, consumed by
+   child_info::proc_retry.  Under sandboxing process creation (e.g. the mxc
+   ProcessContainer) a fork/exec child can die with STATUS_DLL_INIT_FAILED
+   or EXITCODE_RETRY on any given attempt (the child's fixed-address cygheap
+   reservation loses its race with the sandbox's per-process machinery);
+   repeating with a fresh child resolves those deterministically in practice
+   (the failure is per-process random).  CYGWIN=proc_retry=N overrides. */
+#define CHILD_INFO_RETRY_BUDGET 10
+
 #include "pinfo.h"
 struct cchildren
 {

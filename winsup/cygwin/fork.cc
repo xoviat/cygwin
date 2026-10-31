@@ -31,6 +31,15 @@ details. */
 /* FIXME: Once things stabilize, bump up to a few minutes.  */
 #define FORK_WAIT_TIMEOUT (300 * 1000)     /* 300 seconds */
 
+/* Default retry budget for transient child-init failures lives in
+   child_info.h (CHILD_INFO_RETRY_BUDGET); it is seeded in child_info's
+   constructor so fork, spawn and exec children all get it (proc_retry
+   consumes it).  child_copy granularity and per-chunk retries: bounded
+   chunks with retries tolerate transient ERROR_PARTIAL_COPY while a
+   sandboxing backend scans the processes' memory during the copy. */
+#define CHILD_COPY_CHUNK (1 << 20)
+#define CHILD_COPY_RETRIES 5
+
 static int dofork (void **proc, bool do_atfork_handlers, bool *with_forkables);
 class frok
 {
@@ -425,6 +434,32 @@ frok::parent (volatile char * volatile stack_here)
       /* Wait for subproc to initialize itself. */
       if (!ch.sync (pi.dwProcessId, hchild, FORK_WAIT_TIMEOUT))
 	{
+	  /* Let proc_retry classify the child's exit code: transient
+	     child-init deaths (STATUS_DLL_INIT_FAILED, EXITCODE_RETRY)
+	     consume the retry budget and are retried with a fresh child.
+	     proc_retry used to be reachable only with a zero exit code (where
+	     it immediately returns), so its STATUS_DLL_INIT_FAILED retry
+	     machinery never fired and fork failed after the first dead child
+	     ("dofork: ... retry 0, exit code 0xC0000142"). */
+	  DWORD dead_code = ch.exit_code;
+	  if (!ch.proc_retry (hchild))
+	    {
+	      debug_printf ("fork attempt failed (child exit code %y), retrying, budget %d",
+			    dead_code, ch.retry);
+	      /* Re-arm forkables (released after CreateProcess above) so the
+		 retry runs under the same conditions as this attempt. */
+	      dlls.setup_forkables (*with_forkables);
+	      /* The sync-timeout case leaves a live but abandoned child behind
+		 (proc_retry only closes the handle for dead children); kill it
+		 so retries do not accumulate stray children. */
+	      if (!dead_code && hchild)
+		{
+		  TerminateProcess (hchild, 1);
+		  ForceCloseHandle1 (hchild, childhProc);
+		}
+	      Sleep (10);
+	      continue;
+	    }
 	  if (!error ("forked process %u died unexpectedly, retry %d, exit code %y",
 		      pi.dwProcessId, ch.retry, ch.exit_code))
 	    continue;
@@ -774,38 +809,46 @@ child_copy (HANDLE hp, bool write, bool silentfail, ...)
   static const char *huh[] = {"read", "write"};
 
   char *what;
+  char *low;
+  char *high;
+  char *here;
+  SIZE_T todo;
+  SIZE_T done;
+  BOOL res;
   while ((what = va_arg (args, char *)))
     {
-      char *low = va_arg (args, char *);
-      char *high = va_arg (args, char *);
-      SIZE_T todo = high - low;
-      char *here;
+      low = va_arg (args, char *);
+      high = va_arg (args, char *);
 
-      for (here = low; here < high; here += todo)
+      for (here = low; here < high; )
 	{
-	  SIZE_T done = 0;
-	  if (here + todo > high)
-	    todo = high - here;
-	  BOOL res;
-	  if (write)
-	    res = WriteProcessMemory (hp, here, here, todo, &done);
-	  else
-	    res = ReadProcessMemory (hp, here, here, todo, &done);
-	  debug_printf ("%s - hp %p low %p, high %p, res %d", what, hp, low, high, res);
-	  if (!res || todo != done)
+	  /* Copy in bounded chunks: one huge read/write is more likely to come
+	     back as ERROR_PARTIAL_COPY while a sandboxing backend scans the
+	     process' memory (mxc ProcessContainer), and chunking confines the
+	     retry to the affected chunk. */
+	  todo = high - here;
+	  if (todo > CHILD_COPY_CHUNK)
+	    todo = CHILD_COPY_CHUNK;
+	  done = 0;
+	  res = FALSE;
+	  for (unsigned retry = 0; ; retry++)
 	    {
-	      if (!res)
-		__seterrno ();
-	      if (silentfail)
-		debug_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
-			     what, huh[write], low, high, done, myself->dwProcessId);
+	      done = 0;
+	      if (write)
+		res = WriteProcessMemory (hp, here, here, todo, &done);
 	      else
-		/* If this happens then there is a bug in our fork
-		   implementation somewhere. */
-		system_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
-			      what, huh[write], low, high, done, myself->dwProcessId);
-	      goto err;
+		res = ReadProcessMemory (hp, here, here, todo, &done);
+	      debug_printf ("%s - hp %p low %p, high %p, res %d", what, hp,
+			    here, here + todo, res);
+	      if (res && todo == done)
+		break;
+	      if (retry >= CHILD_COPY_RETRIES)
+		goto err;
+	      debug_printf ("%s %s copy retry %u, %p..%p, done %lu, %E",
+			    what, huh[write], retry, here, here + todo, done);
+	      Sleep (1);
 	    }
+	  here += todo;
 	}
     }
 
@@ -814,8 +857,27 @@ child_copy (HANDLE hp, bool write, bool silentfail, ...)
   return true;
 
  err:
+  if (!res)
+    __seterrno ();
+  /* Read side: this is a fork/exec child filling in its own memory from the
+     parent.  Transient copy failures are part of the fork retry cycle, so
+     only report loudly when the parent's retry budget is spent. */
+  if (silentfail || (!write && child_proc_info && child_proc_info->retry))
+    debug_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
+		 what, huh[write], low, high, done, myself->dwProcessId);
+  else
+    /* If this happens then there is a bug in our fork
+       implementation somewhere. */
+    system_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
+		  what, huh[write], low, high, done, myself->dwProcessId);
   va_end (args);
-  TerminateProcess (hp, 1);
+  if (write)
+    TerminateProcess (hp, 1);
+  else
+    /* The half-copied address space must not keep running; die with a
+       retryable code so the parent repeats the fork/spawn rather than
+       continuing with corrupted memory. */
+    TerminateProcess (GetCurrentProcess (), EXITCODE_RETRY);
   set_errno (EAGAIN);
   return false;
 }

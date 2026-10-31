@@ -898,7 +898,9 @@ child_info::child_info (unsigned in_cb, child_info_types chtype,
 			bool need_subproc_ready):
   msv_count (0), cb (in_cb), intro (PROC_MAGIC_GENERIC),
   magic (CHILD_INFO_MAGIC), type (chtype), cygheap (::cygheap),
-  cygheap_max (::cygheap_max), flag (0), retry (child_info::retry_count),
+  cygheap_max (::cygheap_max), flag (0),
+  retry (child_info::retry_count > 0 ? child_info::retry_count
+	 : CHILD_INFO_RETRY_BUDGET),
   rd_proc_pipe (NULL), wr_proc_pipe (NULL), subproc_ready (NULL),
   sigmask (_my_tls.sigmask)
 {

@@ -2,7 +2,7 @@
 
 ```
 $ bash tools/final-verify.sh
-==================== RESULT: 11 passed, 0 failed ====================
+==================== RESULT: 14 passed, 0 failed ====================
 GOAL VERIFIED: git bash works inside the mxc sandbox.
 ```
 
@@ -43,6 +43,7 @@ returns real pids and pipelines work end-to-end.
 | Named mappings | `mm/shared.cc` | DACL-less sections get an explicit everyone-ACE SD (hardened sandboxes rewrite NULL DACLs and then deny siblings); borrowed-handle mapping falls back to name-based reopen; `user_info::create` always derives the name |
 | Pipes | `fhandler/pipe.cc` | absolute NT pipe names (opening the NamedPipe root is denied in-container), CreatePipe-anonymous `\Device\NamedPipe\pipe-%u-` naming (other names' handles get dropped across inheritance), create without OBJ_INHERIT + `SetHandleInformation` afterwards, `need_fork_fixup(true)` (cross-process re-dup of pipe handles), `sec_user` SA for pipes, mutex re-create recovery in `raw_write` |
 | Fork/wincap | `wincap.cc`, `local_includes/shared_info.h`, `tty.cc` | `in_this_image` cross-image wincap guard (PSEC loads per-process copies; "fork-friendly" caps must come from the real kernel), shared-info hardening, tty fixes |
+| Fork retry & diagnostics | `fork.cc`, `mm/cygheap.cc`, `sigproc.cc`, `local_includes/child_info.h` | (2026-10-31, fixes the residual fork failures of FORK_FAILURES.md) checked + retried fixed-address cygheap reservation with real diagnostics (window-walk occupant naming); chunked `child_copy` with per-chunk retries and retryable child death; child deaths routed through `proc_retry` with a seeded retry budget for fork, spawn **and** exec children (the `STATUS_DLL_INIT_FAILED` retry machinery was previously unreachable and the budget was 0) |
 
 **Mandatory companion step (not a source fix):** the mxc PSEC force-relocates
 images that have not opted into ASLR, breaking cygwin's same-address fork.
@@ -82,14 +83,51 @@ over a Git for Windows install's `{usr/bin,bin}/msys-2.0.dll`, run
    toolchain) → checkout msys2-runtime @ pinned → `apply-to-msys.sh` → build
    `msys-2.0.dll` → build the mxc runner example (Rust) → robocopy
    `C:\Program Files\Git` to `tools/git-priv` (copy only) → run
-   `tools/final-verify.sh` (the gate must end `RESULT: 11 passed, 0 failed`).
+   `tools/final-verify.sh` (the gate must end `RESULT: 14 passed, 0 failed`).
 2. **build-dlls** (after verify): build `cygwin1.dll` from this repo's winsup,
    collect both DLLs, `peflag.py set` them, upload as `runtime-dlls`.
 3. **release** (tag pushes only): attach the DLLs to the tag's GitHub release
    (`softprops/action-gh-release`, creates the release if absent). Fallback:
    the `runtime-dlls` workflow artifacts stay downloadable from every run.
 
-## 5. Loose ends (known, non-blocking)
+## 5. Residual fork failures — resolved 2026-10-31
+
+The transient fork failures recorded in `FORK_FAILURES.md` (`child_copy:
+cygheap read copy failed, 0x0..`, `dofork: ... exit code 0xC0000142`,
+`fork: retry: Resource temporarily unavailable`) are **fixed in the
+runtime** and **covered by the gate**:
+
+- **Root cause**: the forked child's fixed-address cygheap reservation
+  (`VirtualAlloc` at `0x800000000`) fails intermittently under the mxc
+  ProcessContainer (per-process-random); the failure was invisible (the
+  NULL `cygheap` produced the misleading `0x0..` partial-copy line and a
+  `0xC0000142` NULL deref), and `frok::parent` never retried because
+  `child_info::proc_retry` was only reachable with a zero exit code and
+  defaulted to a zero retry budget.  Details and fix inventory in
+  `FORK_FAILURES.md` → *Resolution*.
+- **Fixes** (`fork.cc`, `mm/cygheap.cc`, `sigproc.cc`, `local_includes/child_info.h`,
+  in `tools/ci/cygwin-winsup.patch`): checked + briefly retried cygheap
+  reservation with loud end-of-retry diagnostics (the loud form walks the
+  8 GiB window and names its occupant); chunked `child_copy` with per-chunk
+  retries and retryable child death (`EXITCODE_RETRY`); a seeded retry
+  budget (`CHILD_INFO_RETRY_BUDGET` = 10, `CYGWIN=proc_retry=N` overrides)
+  consumed by `proc_retry` for fork, spawn **and** exec children (exec
+  children previously got exactly one attempt — the source of workload data
+  loss even with fork-level retries).  A transient child-init death is now
+  invisible to workloads: the same `fork()`/`exec` succeeds on a retry.
+- **Side fix**: the "git-priv oddity" (a relocated install copy exec'ing
+  silently with exit 127 from an MSYS parent) was the same family —
+  transient `child_copy` partial copies in the cross-copy exec path — and
+  is fixed by the same chunk retries.
+- **Gate**: `tools/final-verify.sh` gained a **sustained fork-churn** step
+  (the `tools/repro-fork/workload.sh` shape at `CHURN_N=100`, ~800 forks:
+  pipelines, chained pipelines, heredoc integrity, command substitution,
+  concurrent forks), classified on the verbatim signatures **and** the
+  workload's integrity markers.  Verified to fail with the pre-fix DLL
+  (exactly the reported signature) and to pass with the fixed build
+  (`RESULT: 14 passed, 0 failed`, plus 5/5 clean repro rounds at n=500).
+
+## 6. Loose ends (known, non-blocking)
 
 0. **CI host support for the ProcessContainer** (established by the gate's
    raw output): the backend needs **Windows PSEC**, which GitHub's
@@ -109,13 +147,14 @@ over a Git for Windows install's `{usr/bin,bin}/msys-2.0.dll`, run
    the workload PATH, but bash's PATH search does not resolve `git` (`type git`
    → not found). Everything else in the gate works; likely a small exec-search
    or policy-path nuance. The gate does not cover `git` itself yet.
-2. `frok::parent`'s "died unexpectedly" retry loop does not TerminateProcess
-   the ghost child (stock semantics; two `sleep.exe` observed) — worth an
-   upstream fix on its own.
+2. ~~`frok::parent`'s "died unexpectedly" retry loop does not TerminateProcess
+   the ghost child (stock semantics; two `sleep.exe` observed)~~ — fixed
+   2026-10-31 along with the fork retry work: the sync-timeout retry now
+   terminates and closes the abandoned child before forking anew.
 3. `child_info::parent_winpid` is never set in the fork path (only
    `spawn.cc` sets it); fork children read uninitialized stack there.
 
-## 6. History
+## 7. History
 
 Root cause and fix were established by instrumenting the msys runtime
 (TEMPORARY DIAGNOSTIC code, all stripped before this branch): name-timeline

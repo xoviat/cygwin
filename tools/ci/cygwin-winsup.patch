@@ -134,6 +134,180 @@ index 2312688..1684005 100644
    access = GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
    status = NtOpenFile (&w, access, &attr, &io, 0, 0);
    if (!NT_SUCCESS (status))
+diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
+index 722d21b..fd8ee8f 100644
+--- a/winsup/cygwin/fork.cc
++++ b/winsup/cygwin/fork.cc
+@@ -31,6 +31,15 @@ details. */
+ /* FIXME: Once things stabilize, bump up to a few minutes.  */
+ #define FORK_WAIT_TIMEOUT (300 * 1000)     /* 300 seconds */
+ 
++/* Default retry budget for transient child-init failures lives in
++   child_info.h (CHILD_INFO_RETRY_BUDGET); it is seeded in child_info's
++   constructor so fork, spawn and exec children all get it (proc_retry
++   consumes it).  child_copy granularity and per-chunk retries: bounded
++   chunks with retries tolerate transient ERROR_PARTIAL_COPY while a
++   sandboxing backend scans the processes' memory during the copy. */
++#define CHILD_COPY_CHUNK (1 << 20)
++#define CHILD_COPY_RETRIES 5
++
+ static int dofork (void **proc, bool do_atfork_handlers, bool *with_forkables);
+ class frok
+ {
+@@ -425,6 +434,32 @@ frok::parent (volatile char * volatile stack_here)
+       /* Wait for subproc to initialize itself. */
+       if (!ch.sync (pi.dwProcessId, hchild, FORK_WAIT_TIMEOUT))
+ 	{
++	  /* Let proc_retry classify the child's exit code: transient
++	     child-init deaths (STATUS_DLL_INIT_FAILED, EXITCODE_RETRY)
++	     consume the retry budget and are retried with a fresh child.
++	     proc_retry used to be reachable only with a zero exit code (where
++	     it immediately returns), so its STATUS_DLL_INIT_FAILED retry
++	     machinery never fired and fork failed after the first dead child
++	     ("dofork: ... retry 0, exit code 0xC0000142"). */
++	  DWORD dead_code = ch.exit_code;
++	  if (!ch.proc_retry (hchild))
++	    {
++	      debug_printf ("fork attempt failed (child exit code %y), retrying, budget %d",
++			    dead_code, ch.retry);
++	      /* Re-arm forkables (released after CreateProcess above) so the
++		 retry runs under the same conditions as this attempt. */
++	      dlls.setup_forkables (*with_forkables);
++	      /* The sync-timeout case leaves a live but abandoned child behind
++		 (proc_retry only closes the handle for dead children); kill it
++		 so retries do not accumulate stray children. */
++	      if (!dead_code && hchild)
++		{
++		  TerminateProcess (hchild, 1);
++		  ForceCloseHandle1 (hchild, childhProc);
++		}
++	      Sleep (10);
++	      continue;
++	    }
+ 	  if (!error ("forked process %u died unexpectedly, retry %d, exit code %y",
+ 		      pi.dwProcessId, ch.retry, ch.exit_code))
+ 	    continue;
+@@ -774,38 +809,46 @@ child_copy (HANDLE hp, bool write, bool silentfail, ...)
+   static const char *huh[] = {"read", "write"};
+ 
+   char *what;
++  char *low;
++  char *high;
++  char *here;
++  SIZE_T todo;
++  SIZE_T done;
++  BOOL res;
+   while ((what = va_arg (args, char *)))
+     {
+-      char *low = va_arg (args, char *);
+-      char *high = va_arg (args, char *);
+-      SIZE_T todo = high - low;
+-      char *here;
++      low = va_arg (args, char *);
++      high = va_arg (args, char *);
+ 
+-      for (here = low; here < high; here += todo)
++      for (here = low; here < high; )
+ 	{
+-	  SIZE_T done = 0;
+-	  if (here + todo > high)
+-	    todo = high - here;
+-	  BOOL res;
+-	  if (write)
+-	    res = WriteProcessMemory (hp, here, here, todo, &done);
+-	  else
+-	    res = ReadProcessMemory (hp, here, here, todo, &done);
+-	  debug_printf ("%s - hp %p low %p, high %p, res %d", what, hp, low, high, res);
+-	  if (!res || todo != done)
++	  /* Copy in bounded chunks: one huge read/write is more likely to come
++	     back as ERROR_PARTIAL_COPY while a sandboxing backend scans the
++	     process' memory (mxc ProcessContainer), and chunking confines the
++	     retry to the affected chunk. */
++	  todo = high - here;
++	  if (todo > CHILD_COPY_CHUNK)
++	    todo = CHILD_COPY_CHUNK;
++	  done = 0;
++	  res = FALSE;
++	  for (unsigned retry = 0; ; retry++)
+ 	    {
+-	      if (!res)
+-		__seterrno ();
+-	      if (silentfail)
+-		debug_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
+-			     what, huh[write], low, high, done, myself->dwProcessId);
++	      done = 0;
++	      if (write)
++		res = WriteProcessMemory (hp, here, here, todo, &done);
+ 	      else
+-		/* If this happens then there is a bug in our fork
+-		   implementation somewhere. */
+-		system_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
+-			      what, huh[write], low, high, done, myself->dwProcessId);
+-	      goto err;
++		res = ReadProcessMemory (hp, here, here, todo, &done);
++	      debug_printf ("%s - hp %p low %p, high %p, res %d", what, hp,
++			    here, here + todo, res);
++	      if (res && todo == done)
++		break;
++	      if (retry >= CHILD_COPY_RETRIES)
++		goto err;
++	      debug_printf ("%s %s copy retry %u, %p..%p, done %lu, %E",
++			    what, huh[write], retry, here, here + todo, done);
++	      Sleep (1);
+ 	    }
++	  here += todo;
+ 	}
+     }
+ 
+@@ -814,8 +857,27 @@ child_copy (HANDLE hp, bool write, bool silentfail, ...)
+   return true;
+ 
+  err:
++  if (!res)
++    __seterrno ();
++  /* Read side: this is a fork/exec child filling in its own memory from the
++     parent.  Transient copy failures are part of the fork retry cycle, so
++     only report loudly when the parent's retry budget is spent. */
++  if (silentfail || (!write && child_proc_info && child_proc_info->retry))
++    debug_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
++		 what, huh[write], low, high, done, myself->dwProcessId);
++  else
++    /* If this happens then there is a bug in our fork
++       implementation somewhere. */
++    system_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
++		  what, huh[write], low, high, done, myself->dwProcessId);
+   va_end (args);
+-  TerminateProcess (hp, 1);
++  if (write)
++    TerminateProcess (hp, 1);
++  else
++    /* The half-copied address space must not keep running; die with a
++       retryable code so the parent repeats the fork/spawn rather than
++       continuing with corrupted memory. */
++    TerminateProcess (GetCurrentProcess (), EXITCODE_RETRY);
+   set_errno (EAGAIN);
+   return false;
+ }
+diff --git a/winsup/cygwin/local_includes/child_info.h b/winsup/cygwin/local_includes/child_info.h
+index e10aa77..ef9cc05 100644
+--- a/winsup/cygwin/local_includes/child_info.h
++++ b/winsup/cygwin/local_includes/child_info.h
+@@ -35,6 +35,15 @@ enum child_status
+ /* Change this value if you get a message indicating that it is out-of-sync. */
+ #define CURR_CHILD_INFO_MAGIC 0x1052d96bU
+ 
++/* Default retry budget for transient child-init failures, consumed by
++   child_info::proc_retry.  Under sandboxing process creation (e.g. the mxc
++   ProcessContainer) a fork/exec child can die with STATUS_DLL_INIT_FAILED
++   or EXITCODE_RETRY on any given attempt (the child's fixed-address cygheap
++   reservation loses its race with the sandbox's per-process machinery);
++   repeating with a fresh child resolves those deterministically in practice
++   (the failure is per-process random).  CYGWIN=proc_retry=N overrides. */
++#define CHILD_INFO_RETRY_BUDGET 10
++
+ #include "pinfo.h"
+ struct cchildren
+ {
 diff --git a/winsup/cygwin/local_includes/security.h b/winsup/cygwin/local_includes/security.h
 index b31edfe..372a779 100644
 --- a/winsup/cygwin/local_includes/security.h
@@ -160,6 +334,119 @@ index 4316717..9afb4d6 100644
  void *open_shared (const WCHAR *, int, HANDLE&, DWORD,
  		   shared_locations, PSECURITY_ATTRIBUTES = &sec_all,
  		   DWORD = FILE_MAP_READ | FILE_MAP_WRITE);
+diff --git a/winsup/cygwin/mm/cygheap.cc b/winsup/cygwin/mm/cygheap.cc
+index 1c9b803..75e7117 100644
+--- a/winsup/cygwin/mm/cygheap.cc
++++ b/winsup/cygwin/mm/cygheap.cc
+@@ -80,6 +80,91 @@ static void *_csbrk (int);
+ #define somekinda_printf malloc_printf
+ #endif
+ 
++/* Reserve and commit the child's cygheap at its fixed address.  This can
++   fail transiently in a forked child under sandboxing process creation
++   (e.g. the mxc ProcessContainer): the child's address space is set up while
++   the sandbox races its own per-process machinery (force image relocation,
++   monitoring) against the child's DLL initialization, and a mapping landing
++   in the fixed cygheap window makes the reservation fail for this attempt.
++   Retry briefly, then give up.  A failed reservation used to go completely
++   unnoticed: the NULL cygheap pointer was then fed to child_copy which
++   reported the misleading "cygheap read copy failed, 0x0.." partial copy,
++   and the child died later in a NULL dereference as 0xC0000142. */
++static init_cygheap *
++alloc_cygheap_in_child (SIZE_T commit_size)
++{
++  for (int i = 0; i < 4; i++)
++    {
++      if (i)
++	Sleep (20);
++      /* Ignore the result of the reservation: if a previous iteration
++	 already reserved the region (commit failed transiently), the commit
++	 below still works against that reservation. */
++      VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
++		    CYGHEAP_STORAGE_HIGH - CYGHEAP_STORAGE_LOW,
++		    MEM_RESERVE, PAGE_NOACCESS);
++      init_cygheap *p = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
++					       commit_size, MEM_COMMIT,
++					       PAGE_READWRITE);
++      if (p)
++	return p;
++    }
++  return NULL;
++}
++
++/* The cygheap cannot be set up and the child cannot continue.  Die with
++   EXITCODE_RETRY so the parent's child_info::proc_retry machinery repeats
++   the fork with a fresh child (the failure is per-process random under
++   sandboxing process creation).  Report loudly only when the parent's retry
++   budget is spent (this is the final attempt); transient reservation
++   failures are part of the fork retry cycle and must not pollute stderr of
++   commands that succeed on retry. */
++static void
++cygheap_die_no_cygheap ()
++{
++  if (!child_proc_info->retry)
++    {
++      DWORD err = GetLastError ();
++      system_printf ("cygheap: VirtualAlloc %p..%p failed in child, Win32 error %u",
++		     (void *) CYGHEAP_STORAGE_LOW, child_proc_info->cygheap_max,
++		     err);
++      /* A partial occupant anywhere in the fixed window fails the whole
++	 reservation, while a query at the window's base alone looks perfectly
++	 free.  Walk the window and name the first region in use. */
++      for (uintptr_t a = CYGHEAP_STORAGE_LOW; a < CYGHEAP_STORAGE_HIGH; )
++	{
++	  MEMORY_BASIC_INFORMATION mbi;
++	  if (!VirtualQuery ((LPVOID) a, &mbi, sizeof mbi) || !mbi.RegionSize)
++	    break;
++	  if (mbi.State != MEM_FREE)
++	    {
++	      WCHAR mod[NT_MAX_PATH];
++	      if (mbi.Type == MEM_IMAGE
++		  && GetModuleFileNameW ((HMODULE) mbi.AllocationBase, mod,
++					 NT_MAX_PATH))
++		system_printf ("cygheap: window occupant %p..%p type %u "
++			       "allocbase %p \"%W\"",
++			       mbi.BaseAddress,
++			       (char *) mbi.BaseAddress + mbi.RegionSize,
++			       mbi.Type, mbi.AllocationBase, mod);
++	      else
++		system_printf ("cygheap: window occupant %p..%p state %u type %u "
++			       "allocbase %p protect %u",
++			       mbi.BaseAddress,
++			       (char *) mbi.BaseAddress + mbi.RegionSize,
++			       mbi.State, mbi.Type, mbi.AllocationBase,
++			       mbi.Protect);
++	      break;
++	    }
++	  a = (uintptr_t) mbi.BaseAddress + mbi.RegionSize;
++	}
++    }
++  else
++    debug_printf ("cygheap: VirtualAlloc %p failed in child (retry budget %d)",
++		  (void *) CYGHEAP_STORAGE_LOW, child_proc_info->retry);
++  TerminateProcess (GetCurrentProcess (), EXITCODE_RETRY);
++}
++
+ /* Called by fork or spawn to reallocate cygwin heap */
+ void
+ cygheap_fixup_in_child (bool execed)
+@@ -89,13 +174,9 @@ cygheap_fixup_in_child (bool execed)
+   if (child_proc_info->cygheap_max > (void *) CYGHEAP_STORAGE_INITIAL)
+     commit_size = allocsize ((char *) child_proc_info->cygheap_max
+                    - CYGHEAP_STORAGE_LOW);
+-  cygheap = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
+-					   CYGHEAP_STORAGE_HIGH
+-					   - CYGHEAP_STORAGE_LOW,
+-					   MEM_RESERVE, PAGE_NOACCESS);
+-  cygheap = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
+-					   commit_size, MEM_COMMIT,
+-					   PAGE_READWRITE);
++  cygheap = alloc_cygheap_in_child (commit_size);
++  if (!cygheap)
++    cygheap_die_no_cygheap ();
+   if (dynamically_loaded && execed)
+     spawn_info->moreinfo->myself_pinfo = NULL;
+   cygheap_max = child_proc_info->cygheap_max;
 diff --git a/winsup/cygwin/mm/shared.cc b/winsup/cygwin/mm/shared.cc
 index 7977df3..8fe73aa 100644
 --- a/winsup/cygwin/mm/shared.cc
@@ -1017,6 +1304,21 @@ index 89090fc..63aeaab 100644
        LPVOID ace;
        status = RtlFirstFreeAce (dacl, &ace);
        if (!NT_SUCCESS (status))
+diff --git a/winsup/cygwin/sigproc.cc b/winsup/cygwin/sigproc.cc
+index 4ff0596..3035419 100644
+--- a/winsup/cygwin/sigproc.cc
++++ b/winsup/cygwin/sigproc.cc
+@@ -898,7 +898,9 @@ child_info::child_info (unsigned in_cb, child_info_types chtype,
+ 			bool need_subproc_ready):
+   msv_count (0), cb (in_cb), intro (PROC_MAGIC_GENERIC),
+   magic (CHILD_INFO_MAGIC), type (chtype), cygheap (::cygheap),
+-  cygheap_max (::cygheap_max), flag (0), retry (child_info::retry_count),
++  cygheap_max (::cygheap_max), flag (0),
++  retry (child_info::retry_count > 0 ? child_info::retry_count
++	 : CHILD_INFO_RETRY_BUDGET),
+   rd_proc_pipe (NULL), wr_proc_pipe (NULL), subproc_ready (NULL),
+   sigmask (_my_tls.sigmask)
+ {
 diff --git a/winsup/cygwin/syscalls.cc b/winsup/cygwin/syscalls.cc
 index 5ca02c0..7671e9d 100644
 --- a/winsup/cygwin/syscalls.cc

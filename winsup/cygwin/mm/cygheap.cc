@@ -80,6 +80,91 @@ static void *_csbrk (int);
 #define somekinda_printf malloc_printf
 #endif
 
+/* Reserve and commit the child's cygheap at its fixed address.  This can
+   fail transiently in a forked child under sandboxing process creation
+   (e.g. the mxc ProcessContainer): the child's address space is set up while
+   the sandbox races its own per-process machinery (force image relocation,
+   monitoring) against the child's DLL initialization, and a mapping landing
+   in the fixed cygheap window makes the reservation fail for this attempt.
+   Retry briefly, then give up.  A failed reservation used to go completely
+   unnoticed: the NULL cygheap pointer was then fed to child_copy which
+   reported the misleading "cygheap read copy failed, 0x0.." partial copy,
+   and the child died later in a NULL dereference as 0xC0000142. */
+static init_cygheap *
+alloc_cygheap_in_child (SIZE_T commit_size)
+{
+  for (int i = 0; i < 4; i++)
+    {
+      if (i)
+	Sleep (20);
+      /* Ignore the result of the reservation: if a previous iteration
+	 already reserved the region (commit failed transiently), the commit
+	 below still works against that reservation. */
+      VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
+		    CYGHEAP_STORAGE_HIGH - CYGHEAP_STORAGE_LOW,
+		    MEM_RESERVE, PAGE_NOACCESS);
+      init_cygheap *p = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
+					       commit_size, MEM_COMMIT,
+					       PAGE_READWRITE);
+      if (p)
+	return p;
+    }
+  return NULL;
+}
+
+/* The cygheap cannot be set up and the child cannot continue.  Die with
+   EXITCODE_RETRY so the parent's child_info::proc_retry machinery repeats
+   the fork with a fresh child (the failure is per-process random under
+   sandboxing process creation).  Report loudly only when the parent's retry
+   budget is spent (this is the final attempt); transient reservation
+   failures are part of the fork retry cycle and must not pollute stderr of
+   commands that succeed on retry. */
+static void
+cygheap_die_no_cygheap ()
+{
+  if (!child_proc_info->retry)
+    {
+      DWORD err = GetLastError ();
+      system_printf ("cygheap: VirtualAlloc %p..%p failed in child, Win32 error %u",
+		     (void *) CYGHEAP_STORAGE_LOW, child_proc_info->cygheap_max,
+		     err);
+      /* A partial occupant anywhere in the fixed window fails the whole
+	 reservation, while a query at the window's base alone looks perfectly
+	 free.  Walk the window and name the first region in use. */
+      for (uintptr_t a = CYGHEAP_STORAGE_LOW; a < CYGHEAP_STORAGE_HIGH; )
+	{
+	  MEMORY_BASIC_INFORMATION mbi;
+	  if (!VirtualQuery ((LPVOID) a, &mbi, sizeof mbi) || !mbi.RegionSize)
+	    break;
+	  if (mbi.State != MEM_FREE)
+	    {
+	      WCHAR mod[NT_MAX_PATH];
+	      if (mbi.Type == MEM_IMAGE
+		  && GetModuleFileNameW ((HMODULE) mbi.AllocationBase, mod,
+					 NT_MAX_PATH))
+		system_printf ("cygheap: window occupant %p..%p type %u "
+			       "allocbase %p \"%W\"",
+			       mbi.BaseAddress,
+			       (char *) mbi.BaseAddress + mbi.RegionSize,
+			       mbi.Type, mbi.AllocationBase, mod);
+	      else
+		system_printf ("cygheap: window occupant %p..%p state %u type %u "
+			       "allocbase %p protect %u",
+			       mbi.BaseAddress,
+			       (char *) mbi.BaseAddress + mbi.RegionSize,
+			       mbi.State, mbi.Type, mbi.AllocationBase,
+			       mbi.Protect);
+	      break;
+	    }
+	  a = (uintptr_t) mbi.BaseAddress + mbi.RegionSize;
+	}
+    }
+  else
+    debug_printf ("cygheap: VirtualAlloc %p failed in child (retry budget %d)",
+		  (void *) CYGHEAP_STORAGE_LOW, child_proc_info->retry);
+  TerminateProcess (GetCurrentProcess (), EXITCODE_RETRY);
+}
+
 /* Called by fork or spawn to reallocate cygwin heap */
 void
 cygheap_fixup_in_child (bool execed)
@@ -89,13 +174,9 @@ cygheap_fixup_in_child (bool execed)
   if (child_proc_info->cygheap_max > (void *) CYGHEAP_STORAGE_INITIAL)
     commit_size = allocsize ((char *) child_proc_info->cygheap_max
                    - CYGHEAP_STORAGE_LOW);
-  cygheap = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
-					   CYGHEAP_STORAGE_HIGH
-					   - CYGHEAP_STORAGE_LOW,
-					   MEM_RESERVE, PAGE_NOACCESS);
-  cygheap = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
-					   commit_size, MEM_COMMIT,
-					   PAGE_READWRITE);
+  cygheap = alloc_cygheap_in_child (commit_size);
+  if (!cygheap)
+    cygheap_die_no_cygheap ();
   if (dynamically_loaded && execed)
     spawn_info->moreinfo->myself_pinfo = NULL;
   cygheap_max = child_proc_info->cygheap_max;

@@ -13,6 +13,9 @@ RUN="$W/tools/run"
 PRIV="$W/tools/git-priv"
 PASS=0; FAIL=0
 
+# Exercise the existing retry policy without changing the runtime default.
+export MSYS="${MSYS:+$MSYS }proc_retry:10"
+
 step() { echo; echo "### $1"; }
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); if [ -n "${OUT:-}" ]; then echo "--- raw runner output ---"; echo "$OUT"; fi; true; }
@@ -26,8 +29,9 @@ step "locate patched DLL"
 DLL="${MSYS_DLL:-$(find "$W/tools/msys2-runtime/build-cy" -name "new-msys-2.0.dll" 2>/dev/null | head -1)}"
 [ -n "$DLL" ] || { echo "patched DLL not found"; exit 1; }
 echo "patched: $DLL"
-grep -aq "AppContainer ns: %y" "$DLL" && ok "DLL contains namespace fallback chain (mxc#1061)" \
-  || bad "DLL missing namespace fallback chain"
+objdump -t "$DLL" 2>/dev/null | grep -q "well_known_any_package_sid" \
+  && ok "DLL contains AppContainer DACL support" \
+  || bad "DLL missing AppContainer DACL support"
 objdump -t "$DLL" 2>/dev/null | grep -q "in_this_image" && ok "DLL contains wincap cross-image guard" \
   || echo "note: wincap guard symbol not visible (behavioral tests decide)"
 

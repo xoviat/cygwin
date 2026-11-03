@@ -282,25 +282,14 @@ wincapc wincap __attribute__((section (".cygwin_dll_common"), shared));
 extern IMAGE_DOS_HEADER
 __image_base__;
 
-/* True when P points into THIS process' instance of the runtime DLL.
-   The .cygwin_dll_common section survives fork/exec, so an exec'd child
-   inherits the parent's `caps` value, which points into the PARENT'S
-   image.  When this DLL instance is mapped at a different base (ASLR,
-   or sandboxes that force image relocation such as MXC's
-   ProcessContainer), that inherited pointer dangles and the first
-   capability query faults (microsoft/mxc#1061 follow-up).  Only trust an
-   inherited `caps` when it lands inside our own image. */
+/* The shared wincap structure may contain a caps pointer into another
+   process' image after exec.  Ignore it if this DLL was relocated. */
 static bool
 in_this_image (const void *p)
 {
-  MEMORY_BASIC_INFORMATION mbi_base, mbi_p;
-  if (!VirtualQuery (&__image_base__, &mbi_base, sizeof mbi_base))
-    return false;
-  if (!VirtualQuery (p, &mbi_p, sizeof mbi_p))
-    return false;
-  /* Same allocation block == same instance of this DLL, even when this
-   * instance is mapped at a relocated base. */
-  return mbi_p.AllocationBase == mbi_base.AllocationBase;
+  MEMORY_BASIC_INFORMATION mbi;
+  return VirtualQuery (p, &mbi, sizeof mbi)
+	 && mbi.AllocationBase == &__image_base__;
 }
 
 void
@@ -308,8 +297,9 @@ wincapc::init ()
 {
   PIMAGE_NT_HEADERS ntheader;
   USHORT emul_mach;
+
   if (caps && in_this_image (caps))
-    return;		// already initialized for THIS image
+    return;		// already initialized
   caps = NULL;
 
   GetSystemInfo (&system_info);

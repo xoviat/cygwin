@@ -475,13 +475,15 @@ index ba65aca3d..c1a6fbefb 100644
    ProtectHandle (mutex);
  }
 diff --git a/winsup/cygwin/uinfo.cc b/winsup/cygwin/uinfo.cc
-index 5c0616a8a..30fe3d84a 100644
+index 5c0616a8a..9b0ec1cec 100644
 --- a/winsup/cygwin/uinfo.cc
 +++ b/winsup/cygwin/uinfo.cc
-@@ -2532,6 +2532,14 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, bool ugid_caching, cy
- 		  if (nas != NERR_Success)
- 		    {
- 		      debug_printf ("NetUserGetInfo(%W) %u", name, nas);
+@@ -2529,9 +2529,20 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, bool ugid_caching, cy
+ 	      if (acc_type == SidTypeUser)
+ 		{
+ 		  nas = NetUserGetInfo (NULL, name, 3, (PBYTE *) &ui);
++		  if (nas == ERROR_ACCESS_DENIED)
++		    {
 +		      /* SAM may be inaccessible to restricted tokens.  Still honor
 +			 nsswitch settings which do not depend on SAM. */
 +		      home = cygheap->pg.get_home ((PUSER_INFO_3) NULL, sid, dom,
@@ -490,6 +492,10 @@ index 5c0616a8a..30fe3d84a 100644
 +						     name, fully_qualified_name);
 +		      gecos = cygheap->pg.get_gecos ((PUSER_INFO_3) NULL, sid, dom,
 +						     name, fully_qualified_name);
++		    }
+ 		  if (nas != NERR_Success)
+ 		    {
+ 		      debug_printf ("NetUserGetInfo(%W) %u", name, nas);
  		      break;
  		    }
  		  /* Overwrite name to be sure case is same as in SAM */

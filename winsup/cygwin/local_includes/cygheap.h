@@ -500,6 +500,7 @@ struct init_cygheap: public mini_cygheap
 {
 private:
   static SRWLOCK cygheap_protect;
+  static DWORD cygheap_lock_owner;
 public:
   _cmalloc_entry *chain;
   char *buckets[NBUCKETS];
@@ -543,8 +544,27 @@ public:
   threadlist_t *find_tls (int, bool&);
   sigset_t compute_sigblkmask ();
   void unlock_tls (threadlist_t *t) { if (t) ReleaseMutex (t->mutex); }
-  inline void lock () { AcquireSRWLockExclusive (&cygheap_protect); }
-  inline void unlock () { ReleaseSRWLockExclusive (&cygheap_protect); }
+  inline void lock ()
+  {
+    AcquireSRWLockExclusive (&cygheap_protect);
+    cygheap_lock_owner = GetCurrentThreadId ();
+  }
+  inline void unlock ()
+  {
+    cygheap_lock_owner = 0;
+    ReleaseSRWLockExclusive (&cygheap_protect);
+  }
+  /* SRWLOCK has no owner tracking.  If SEH unwinds a critical section,
+     release the lock owned by this thread so the next allocation does not
+     deadlock behind the abandoned acquisition. */
+  static void unlock_on_unwind ()
+  {
+    if (cygheap_lock_owner == GetCurrentThreadId ())
+      {
+	cygheap_lock_owner = 0;
+	ReleaseSRWLockExclusive (&cygheap_protect);
+      }
+  }
 };
 
 

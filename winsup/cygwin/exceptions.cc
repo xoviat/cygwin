@@ -624,6 +624,7 @@ exception::myfault (EXCEPTION_RECORD *e, exception_list *frame, CONTEXT *in,
   PSCOPE_TABLE table = (PSCOPE_TABLE) dispatch->HandlerData;
   void *jump_target = ((char *) dispatch->ImageBase) + table->ScopeRecord[0].JumpTarget;
 
+  init_cygheap::unlock_on_unwind ();
   CONTEXT c;
   RtlUnwindEx (frame, jump_target, e, 0, &c, dispatch->HistoryTable);
   /* NOTREACHED, make gcc happy. */
@@ -645,6 +646,7 @@ myfault_altstack_handler (EXCEPTION_POINTERS *exc)
 
   if (me.andreas)
     {
+      init_cygheap::unlock_on_unwind ();
       CONTEXT *c = exc->ContextRecord;
 
       /* Unwind the stack manually and call RtlRestoreContext.  This

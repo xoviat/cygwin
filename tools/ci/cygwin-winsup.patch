@@ -1,9 +1,24 @@
+diff --git a/winsup/cygwin/exceptions.cc b/winsup/cygwin/exceptions.cc
+index 1284ab17c..b1fe0aeae 100644
+--- a/winsup/cygwin/exceptions.cc
++++ b/winsup/cygwin/exceptions.cc
+@@ -625,4 +625,5 @@ exception::myfault (EXCEPTION_RECORD *e, exception_list *frame, CONTEXT *in,
+   void *jump_target = ((char *) dispatch->ImageBase) + table->ScopeRecord[0].JumpTarget;
+ 
++  init_cygheap::unlock_on_unwind ();
+   CONTEXT c;
+   RtlUnwindEx (frame, jump_target, e, 0, &c, dispatch->HistoryTable);
+@@ -646,4 +647,5 @@ myfault_altstack_handler (EXCEPTION_POINTERS *exc)
+   if (me.andreas)
+     {
++      init_cygheap::unlock_on_unwind ();
+       CONTEXT *c = exc->ContextRecord;
+ 
 diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
 index 722d21bdb..3e95961b6 100644
 --- a/winsup/cygwin/fork.cc
 +++ b/winsup/cygwin/fork.cc
-@@ -425,6 +425,12 @@ frok::parent (volatile char * volatile stack_here)
-       /* Wait for subproc to initialize itself. */
+@@ -426,4 +426,10 @@ frok::parent (volatile char * volatile stack_here)
        if (!ch.sync (pi.dwProcessId, hchild, FORK_WAIT_TIMEOUT))
  	{
 +	  /* Honor proc_retry for transient child initialization failures. */
@@ -14,9 +29,7 @@ index 722d21bdb..3e95961b6 100644
 +	    }
  	  if (!error ("forked process %u died unexpectedly, retry %d, exit code %y",
  		      pi.dwProcessId, ch.retry, ch.exit_code))
- 	    continue;
-@@ -796,7 +802,8 @@ child_copy (HANDLE hp, bool write, bool silentfail, ...)
- 	    {
+@@ -797,5 +803,6 @@ child_copy (HANDLE hp, bool write, bool silentfail, ...)
  	      if (!res)
  		__seterrno ();
 -	      if (silentfail)
@@ -24,9 +37,7 @@ index 722d21bdb..3e95961b6 100644
 +				 && child_proc_info->retry))
  		debug_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
  			     what, huh[write], low, high, done, myself->dwProcessId);
- 	      else
-@@ -815,7 +822,9 @@ child_copy (HANDLE hp, bool write, bool silentfail, ...)
- 
+@@ -816,5 +823,7 @@ child_copy (HANDLE hp, bool write, bool silentfail, ...)
   err:
    va_end (args);
 -  TerminateProcess (hp, 1);
@@ -35,46 +46,82 @@ index 722d21bdb..3e95961b6 100644
 +		    write ? 1 : EXITCODE_RETRY);
    set_errno (EAGAIN);
    return false;
- }
+diff --git a/winsup/cygwin/local_includes/cygheap.h b/winsup/cygwin/local_includes/cygheap.h
+index db740f03d..a1846e710 100644
+--- a/winsup/cygwin/local_includes/cygheap.h
++++ b/winsup/cygwin/local_includes/cygheap.h
+@@ -501,4 +501,5 @@ struct init_cygheap: public mini_cygheap
+ private:
+   static SRWLOCK cygheap_protect;
++  static DWORD cygheap_lock_owner;
+ public:
+   _cmalloc_entry *chain;
+@@ -544,6 +545,25 @@ public:
+   sigset_t compute_sigblkmask ();
+   void unlock_tls (threadlist_t *t) { if (t) ReleaseMutex (t->mutex); }
+-  inline void lock () { AcquireSRWLockExclusive (&cygheap_protect); }
+-  inline void unlock () { ReleaseSRWLockExclusive (&cygheap_protect); }
++  inline void lock ()
++  {
++    AcquireSRWLockExclusive (&cygheap_protect);
++    cygheap_lock_owner = GetCurrentThreadId ();
++  }
++  inline void unlock ()
++  {
++    cygheap_lock_owner = 0;
++    ReleaseSRWLockExclusive (&cygheap_protect);
++  }
++  /* SRWLOCK has no owner tracking.  If SEH unwinds a critical section,
++     release the lock owned by this thread so the next allocation does not
++     deadlock behind the abandoned acquisition. */
++  static void unlock_on_unwind ()
++  {
++    if (cygheap_lock_owner == GetCurrentThreadId ())
++      {
++	cygheap_lock_owner = 0;
++	ReleaseSRWLockExclusive (&cygheap_protect);
++      }
++  }
+ };
+ 
 diff --git a/winsup/cygwin/local_includes/security.h b/winsup/cygwin/local_includes/security.h
 index b31edfe26..f0302e396 100644
 --- a/winsup/cygwin/local_includes/security.h
 +++ b/winsup/cygwin/local_includes/security.h
-@@ -48,7 +48,7 @@ bool check_token_membership (PSID);
- #define MAX_DACL_LEN(n) (sizeof (ACL) \
+@@ -49,5 +49,5 @@ bool check_token_membership (PSID);
  		   + (n) * (sizeof (ACCESS_ALLOWED_ACE) - sizeof (DWORD) \
  			    + SECURITY_MAX_SID_SIZE))
 -#define SD_MIN_SIZE (sizeof (SECURITY_DESCRIPTOR) + MAX_DACL_LEN (1))
 +#define SD_MIN_SIZE (sizeof (SECURITY_DESCRIPTOR) + MAX_DACL_LEN (2))
  #define ACL_MAXIMUM_SIZE 65532	/* Yeah, right.  64K - sizeof (DWORD). */
  #define SD_MAXIMUM_SIZE 65536
- #define NO_SID ((PSID)NULL)
-@@ -367,6 +367,7 @@ public:
- 
+@@ -368,4 +368,5 @@ public:
  extern cygpsid well_known_null_sid;
  extern cygpsid well_known_world_sid;
 +extern cygpsid well_known_any_package_sid;
  extern cygpsid well_known_local_sid;
  extern cygpsid well_known_console_logon_sid;
- extern cygpsid well_known_creator_owner_sid;
 diff --git a/winsup/cygwin/local_includes/shared_info.h b/winsup/cygwin/local_includes/shared_info.h
 index 4316717a9..9afb4d680 100644
 --- a/winsup/cygwin/local_includes/shared_info.h
 +++ b/winsup/cygwin/local_includes/shared_info.h
-@@ -89,6 +89,7 @@ HANDLE get_shared_parent_dir ();
- HANDLE get_session_parent_dir ();
+@@ -90,4 +90,5 @@ HANDLE get_session_parent_dir ();
  char *shared_name (char *, const char *, int);
  WCHAR *shared_name (WCHAR *, const WCHAR *, int);
 +HANDLE open_shared_mutex (const WCHAR *, int);
  void *open_shared (const WCHAR *, int, HANDLE&, DWORD,
  		   shared_locations, PSECURITY_ATTRIBUTES = &sec_all,
- 		   DWORD = FILE_MAP_READ | FILE_MAP_WRITE);
 diff --git a/winsup/cygwin/mm/cygheap.cc b/winsup/cygwin/mm/cygheap.cc
-index 1c9b8037b..a368b517e 100644
+index 1c9b8037b..dbc66317c 100644
 --- a/winsup/cygwin/mm/cygheap.cc
 +++ b/winsup/cygwin/mm/cygheap.cc
-@@ -84,18 +84,27 @@ static void *_csbrk (int);
- void
+@@ -37,4 +37,5 @@ void NO_COPY *cygheap_max;
+ 
+ SRWLOCK NO_COPY init_cygheap::cygheap_protect = SRWLOCK_INIT;
++DWORD NO_COPY init_cygheap::cygheap_lock_owner = 0;
+ 
+ struct cygheap_entry
+@@ -85,9 +86,8 @@ void
  cygheap_fixup_in_child (bool execed)
  {
 -  SIZE_T commit_size = CYGHEAP_STORAGE_INITIAL - CYGHEAP_STORAGE_LOW;
@@ -88,7 +135,7 @@ index 1c9b8037b..a368b517e 100644
 +     only the used range. */
    cygheap = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
  					   CYGHEAP_STORAGE_HIGH
- 					   - CYGHEAP_STORAGE_LOW,
+@@ -95,6 +95,16 @@ cygheap_fixup_in_child (bool execed)
  					   MEM_RESERVE, PAGE_NOACCESS);
    cygheap = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
 -					   commit_size, MEM_COMMIT,
@@ -106,13 +153,11 @@ index 1c9b8037b..a368b517e 100644
 +    }
    if (dynamically_loaded && execed)
      spawn_info->moreinfo->myself_pinfo = NULL;
-   cygheap_max = child_proc_info->cygheap_max;
 diff --git a/winsup/cygwin/mm/shared.cc b/winsup/cygwin/mm/shared.cc
 index 7977df382..535fc4346 100644
 --- a/winsup/cygwin/mm/shared.cc
 +++ b/winsup/cygwin/mm/shared.cc
-@@ -29,6 +29,102 @@ user_info NO_COPY *user_shared;
- HANDLE NO_COPY cygwin_shared_h;
+@@ -30,4 +30,100 @@ HANDLE NO_COPY cygwin_shared_h;
  HANDLE NO_COPY cygwin_user_h;
  
 +static HANDLE
@@ -213,9 +258,7 @@ index 7977df382..535fc4346 100644
 +
  /* This function returns a handle to the top-level directory in the global
     NT namespace used to implement global objects including shared memory. */
- 
-@@ -43,18 +139,27 @@ get_shared_parent_dir ()
- 
+@@ -44,16 +140,25 @@ get_shared_parent_dir ()
    if (!shared_parent_dir)
      {
 -      WCHAR bnoname[MAX_PATH];
@@ -253,18 +296,14 @@ index 7977df382..535fc4346 100644
 +	}
      }
    return shared_parent_dir;
- }
-@@ -90,7 +195,7 @@ get_session_parent_dir ()
- 	  status = NtCreateDirectoryObject (&session_parent_dir,
+@@ -91,5 +196,5 @@ get_session_parent_dir ()
  					    CYG_SHARED_DIR_ACCESS, &attr);
  	  if (!NT_SUCCESS (status))
 -	    api_fatal ("NtCreateDirectoryObject(%S): %y", &uname, status);
 +	    session_parent_dir = get_shared_parent_dir ();
  	}
      }
-   return session_parent_dir;
-@@ -110,6 +215,84 @@ shared_name (WCHAR *ret_buf, const WCHAR *str, int num)
-   return ret_buf;
+@@ -111,4 +216,82 @@ shared_name (WCHAR *ret_buf, const WCHAR *str, int num)
  }
  
 +/* Create or open a named section in the AppContainer object directory. */
@@ -347,9 +386,7 @@ index 7977df382..535fc4346 100644
 +
  #define page_const ((ptrdiff_t) 65535)
  #define pround(n) ((ptrdiff_t)(((n) + page_const) & ~page_const))
- 
-@@ -132,13 +315,22 @@ open_shared (const WCHAR *name, int n, HANDLE& shared_h, DWORD size,
-   WCHAR *mapname = NULL;
+@@ -133,5 +316,8 @@ open_shared (const WCHAR *name, int n, HANDLE& shared_h, DWORD size,
    void *shared;
    void *addr;
 +  const bool ac = name && in_appcontainer ();
@@ -358,7 +395,7 @@ index 7977df382..535fc4346 100644
 +    shared_h = NULL;
    created = false;
    if (!shared_h)
-     {
+@@ -139,5 +325,11 @@ open_shared (const WCHAR *name, int n, HANDLE& shared_h, DWORD size,
        if (name)
  	mapname = shared_name (map_buf, name, n);
 -      if (m == SH_JUSTOPEN)
@@ -371,30 +408,24 @@ index 7977df382..535fc4346 100644
 +      else if (m == SH_JUSTOPEN)
  	shared_h = OpenFileMappingW (access, FALSE, mapname);
        else
- 	{
-@@ -231,7 +423,7 @@ user_info::create (bool reinit)
-       cygwin_user_h = NULL;
+@@ -232,5 +424,5 @@ user_info::create (bool reinit)
      }
  
 -  if (!cygwin_user_h)
 +  if (!cygwin_user_h || in_appcontainer ())
      cygheap->user.get_windows_id (name);
  
-   user_shared = (user_info *) open_shared (name, USER_VERSION,
-@@ -322,6 +514,7 @@ shared_info::initialize ()
- void
+@@ -323,4 +515,5 @@ void
  memory_init ()
  {
 +  get_shared_parent_dir ();
    shared_info::create ();	/* Initialize global shared memory */
    cygheap->user_heap.init ();	/* Initialize user heap */
-   user_info::create (false);	/* Initialize per-user shared memory */
 diff --git a/winsup/cygwin/sec/helper.cc b/winsup/cygwin/sec/helper.cc
 index 89090fc92..da14f2034 100644
 --- a/winsup/cygwin/sec/helper.cc
 +++ b/winsup/cygwin/sec/helper.cc
-@@ -42,6 +42,9 @@ MKSID (well_known_null_sid, "S-1-0-0",
-        SECURITY_NULL_SID_AUTHORITY, 1, SECURITY_NULL_RID);
+@@ -43,4 +43,7 @@ MKSID (well_known_null_sid, "S-1-0-0",
  MKSID (well_known_world_sid, "S-1-1-0",
         SECURITY_WORLD_SID_AUTHORITY, 1, SECURITY_WORLD_RID);
 +MKSID (well_known_any_package_sid, "S-1-15-2-1",
@@ -402,18 +433,14 @@ index 89090fc92..da14f2034 100644
 +       SECURITY_APP_PACKAGE_BASE_RID, SECURITY_BUILTIN_PACKAGE_ANY_PACKAGE);
  MKSID (well_known_local_sid, "S-1-2-0",
         SECURITY_LOCAL_SID_AUTHORITY, 1, SECURITY_LOCAL_RID);
- MKSID (well_known_console_logon_sid, "S-1-2-1",
-@@ -547,7 +550,7 @@ bool
- sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD access2)
+@@ -548,5 +551,5 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
  {
    NTSTATUS status;
 -  size_t acl_len = MAX_DACL_LEN (5);
 +  size_t acl_len = MAX_DACL_LEN (6);
    LPVOID pAce;
    cygpsid psid;
- 
-@@ -591,6 +594,11 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
- 				   well_known_system_sid);
+@@ -592,4 +595,9 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
    if (!NT_SUCCESS (status))
      debug_printf ("RtlAddAccessAllowedAce(system) %y", status);
 +  /* Allow AppContainer clients to access objects shared with their parent. */
@@ -423,18 +450,14 @@ index 89090fc92..da14f2034 100644
 +    debug_printf ("RtlAddAccessAllowedAce(any package) %y", status);
    status = RtlFirstFreeAce (acl, &pAce);
    if (NT_SUCCESS (status) && pAce)
-     acl->AclSize = (char *) pAce - (char *) acl;
-@@ -693,7 +701,7 @@ _everyone_sd (void *buf, ACCESS_MASK access)
-     {
+@@ -694,5 +702,5 @@ _everyone_sd (void *buf, ACCESS_MASK access)
        RtlCreateSecurityDescriptor (psd, SECURITY_DESCRIPTOR_REVISION);
        PACL dacl = (PACL) (psd + 1);
 -      RtlCreateAcl (dacl, MAX_DACL_LEN (1), ACL_REVISION);
 +      RtlCreateAcl (dacl, MAX_DACL_LEN (2), ACL_REVISION);
        status = RtlAddAccessAllowedAce (dacl, ACL_REVISION, access,
  				       well_known_world_sid);
-       if (!NT_SUCCESS (status))
-@@ -701,6 +709,14 @@ _everyone_sd (void *buf, ACCESS_MASK access)
- 	  debug_printf ("RtlAddAccessAllowedAce: %y", status);
+@@ -702,4 +710,12 @@ _everyone_sd (void *buf, ACCESS_MASK access)
  	  return NULL;
  	}
 +      /* AppContainer processes are not covered by the world SID. */
@@ -447,39 +470,33 @@ index 89090fc92..da14f2034 100644
 +	}
        LPVOID ace;
        status = RtlFirstFreeAce (dacl, &ace);
-       if (!NT_SUCCESS (status))
 diff --git a/winsup/cygwin/syscalls.cc b/winsup/cygwin/syscalls.cc
 index 5ca02c0a1..e955923d9 100644
 --- a/winsup/cygwin/syscalls.cc
 +++ b/winsup/cygwin/syscalls.cc
-@@ -3661,7 +3661,7 @@ seteuid (uid_t uid)
- 	debug_printf ("NtSetInformationToken (user.token, TokenPrimaryGroup),"
+@@ -3662,5 +3662,5 @@ seteuid (uid_t uid)
  		      "%y", status);
        /* Try setting default DACL */
 -      PACL dacl_buf = (PACL) alloca (MAX_DACL_LEN (5));
 +      PACL dacl_buf = (PACL) alloca (MAX_DACL_LEN (6));
        if (sec_acl (dacl_buf, true, true, usersid))
  	{
- 	  TOKEN_DEFAULT_DACL tdacl = { dacl_buf };
 diff --git a/winsup/cygwin/tty.cc b/winsup/cygwin/tty.cc
 index ba65aca3d..c1a6fbefb 100644
 --- a/winsup/cygwin/tty.cc
 +++ b/winsup/cygwin/tty.cc
-@@ -71,7 +71,7 @@ tty_list::init_session ()
-   char *name = shared_name (mutex_name, "tty_list::mutex", 0);
+@@ -72,5 +72,5 @@ tty_list::init_session ()
  
    /* tty_list::mutex is used while searching for a tty slot */
 -  if (!(mutex = CreateMutex (&sec_all_nih, FALSE, name)))
 +  if (!(mutex = open_shared_mutex (L"tty_list::mutex", 0)))
      api_fatal ("can't create tty_list::mutex '%s', %E", name);
    ProtectHandle (mutex);
- }
 diff --git a/winsup/cygwin/uinfo.cc b/winsup/cygwin/uinfo.cc
 index 5c0616a8a..9b0ec1cec 100644
 --- a/winsup/cygwin/uinfo.cc
 +++ b/winsup/cygwin/uinfo.cc
-@@ -2529,9 +2529,20 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, bool ugid_caching, cy
- 	      if (acc_type == SidTypeUser)
+@@ -2530,4 +2530,15 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, bool ugid_caching, cy
  		{
  		  nas = NetUserGetInfo (NULL, name, 3, (PBYTE *) &ui);
 +		  if (nas == ERROR_ACCESS_DENIED)
@@ -495,16 +512,11 @@ index 5c0616a8a..9b0ec1cec 100644
 +		    }
  		  if (nas != NERR_Success)
  		    {
- 		      debug_printf ("NetUserGetInfo(%W) %u", name, nas);
- 		      break;
- 		    }
- 		  /* Overwrite name to be sure case is same as in SAM */
 diff --git a/winsup/cygwin/wincap.cc b/winsup/cygwin/wincap.cc
 index f94b9f60b..588a29d73 100644
 --- a/winsup/cygwin/wincap.cc
 +++ b/winsup/cygwin/wincap.cc
-@@ -282,14 +282,25 @@ wincapc wincap __attribute__((section (".cygwin_dll_common"), shared));
- extern IMAGE_DOS_HEADER
+@@ -283,4 +283,14 @@ extern IMAGE_DOS_HEADER
  __image_base__;
  
 +/* The shared wincap structure may contain a caps pointer into another
@@ -519,8 +531,7 @@ index f94b9f60b..588a29d73 100644
 +
  void
  wincapc::init ()
- {
-   PIMAGE_NT_HEADERS ntheader;
+@@ -289,6 +299,7 @@ wincapc::init ()
    USHORT emul_mach;
  
 -  if (caps)
@@ -529,4 +540,3 @@ index f94b9f60b..588a29d73 100644
 +  caps = NULL;
  
    GetSystemInfo (&system_info);
-   version.dwOSVersionInfoSize = sizeof (RTL_OSVERSIONINFOEXW);

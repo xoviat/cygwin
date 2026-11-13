@@ -31,6 +31,34 @@ else
   echo "applied $PATCH (patch -p1, fuzz)"
 fi
 
+# The upstream and MSYS trees have different exception::myfault bodies.
+# patch fuzz can otherwise place the new cygheap unlock call in the comment
+# before myfault_altstack_handler.  Normalize the two exact call sites and
+# remove any fuzz-misplaced copies before validating the transfer.
+awk '
+  /init_cygheap::unlock_on_unwind \(\);/ { next }
+  /^exception::myfault / { in_myfault = 1 }
+  in_myfault && /PSCOPE_TABLE table =/ {
+    print
+    print "  init_cygheap::unlock_on_unwind ();"
+    next
+  }
+  /^myfault_altstack_handler / { in_altstack = 1 }
+  in_altstack && /if \(me.andreas\)/ {
+    print
+    print "      init_cygheap::unlock_on_unwind ();"
+    next
+  }
+  { print }
+' winsup/cygwin/exceptions.cc > winsup/cygwin/exceptions.cc.fixed
+mv winsup/cygwin/exceptions.cc.fixed winsup/cygwin/exceptions.cc
+sed -n '/^exception::myfault /,/^}/p' winsup/cygwin/exceptions.cc \
+  | grep -q 'init_cygheap::unlock_on_unwind ();' \
+  || { echo "cygheap unlock missing from exception::myfault" >&2; exit 1; }
+sed -n '/^myfault_altstack_handler /,/^}/p' winsup/cygwin/exceptions.cc \
+  | grep -q 'init_cygheap::unlock_on_unwind ();' \
+  || { echo "cygheap unlock missing from altstack handler" >&2; exit 1; }
+
 # Prove every hunk landed: the patched files must differ from HEAD exactly
 # in the expected files, with no .rej/.orig litter.
 if ls winsup/cygwin/**/*.rej winsup/cygwin/*.rej 2>/dev/null | grep -q .; then

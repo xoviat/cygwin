@@ -65,7 +65,7 @@ over a Git for Windows install's `{usr/bin,bin}/msys-2.0.dll`, run
 
 - This repo = the cygwin tree; the fixes live in `winsup/cygwin/`.
 - `tools/ci/cygwin-winsup.patch` — the canonical patch (generated with
-  `git diff 2ff49b026 -- winsup/`: the full mxc delta over the upstream
+  `git diff -U2 2ff49b026 -- winsup/`: the full mxc delta over the upstream
   base).
 - `tools/ci/apply-to-msys.sh <msys2-runtime-src>` — transfers it to a clean
   git-for-windows/msys2-runtime checkout (pinned in `tools/ci/MSYS2_RUNTIME_REF`).
@@ -133,7 +133,7 @@ runtime** and **covered by the gate**:
   concurrent forks), classified on the verbatim signatures **and** the
   workload's integrity markers.  Verified to fail with the pre-fix DLL
   (exactly the reported signature) and to pass with the fixed build
-  (`RESULT: 14 passed, 0 failed`, plus 5/5 clean repro rounds at n=500).
+  (`RESULT: 15 passed, 0 failed`, plus 5/5 clean repro rounds at n=500).
 
 ## 6. Loose ends (known, non-blocking)
 
@@ -185,9 +185,22 @@ with the fixed DLL: `pw_dir` resolves to the profile (`/c/Users/<user>`
 or whatever `$HOME` says — the `env` scheme now wins under the token
 too), `ssh -G` reports the real `userknownhostsfile`, and
 `git ls-remote origin` over SSH succeeds.  The full gate stays green
-(14 passed, 0 failed).
+(15 passed, 0 failed).
 
-## 8. History
+## 8. Cygheap lock wedges — fixed 2026-11-12
+
+`CYGHEAP_LOCK_WEDGES.md` documents a deterministic ProcessContainer repro and
+the captured root cause: an access violation after `_csbrk()` unwinds out of
+`_cmalloc()` without releasing `cygheap_protect`; the next allocation on the
+same TID self-deadlocks on the non-recursive SRWLOCK.  The runtime now tracks
+the owning TID and releases that acquisition in `exception::myfault` and the
+alternate-stack unwind path.  The gate requires every child in a 20-way burst
+to complete while deliberately ignoring exit status, so the independent
+underlying `EFAULT` cannot recreate a permanent hang.  A 200/200 wedged burst
+now completes immediately.  **The separate runtime-specific memory fault is
+still open** and is not hidden by this fix.
+
+## 9. History
 
 Root cause and fix were established by instrumenting the msys runtime
 (TEMPORARY DIAGNOSTIC code, all stripped before this branch): name-timeline

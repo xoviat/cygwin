@@ -36,6 +36,7 @@ init_cygheap NO_COPY *cygheap = (init_cygheap *) &cygheap_dummy;
 void NO_COPY *cygheap_max;
 
 SRWLOCK NO_COPY init_cygheap::cygheap_protect = SRWLOCK_INIT;
+DWORD NO_COPY init_cygheap::cygheap_lock_owner = 0;
 
 struct cygheap_entry
 {

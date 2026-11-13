@@ -179,6 +179,39 @@ echo "$OUT" | get_stdout | grep -q "CHURN_OK fails=0" \
   || bad "fork churn workload lost data"
 echo "$OUT" | grep -q "Exited(0)" && ok "fork churn exit 0" || bad "fork churn exit code"
 
+# Regression for CYGHEAP_LOCK_WEDGES: an SEH unwind can abandon _cmalloc
+# while it owns cygheap_protect.  The next allocation on that thread then
+# self-deadlocks.  A completion marker is required from every child, but its
+# exit status is deliberately ignored: the separate underlying EFAULT is not
+# this regression and must not turn into another permanent hang.
+step "mxc run: SEH unwind cannot orphan cygheap lock"
+WEDGE_SH="$(cygpath -u "${TEMP:-/tmp}")/mxc-cygheap-unwind.sh"
+cat > "$WEDGE_SH" <<'WEDGE_EOF'
+#!/bin/bash
+set -u
+OUT=/tmp/cygheap-unwind-$PPID
+rm -rf "$OUT"
+mkdir -p "$OUT"
+printf x > "$OUT/a"
+printf x > "$OUT/b"
+for i in $(seq 1 20); do
+  ( diff "$OUT/a" "$OUT/b"; echo $? > "$OUT/m.$i" ) &
+done
+sleep 15
+markers=0
+for marker in "$OUT"/m.*; do
+  [ -f "$marker" ] && markers=$((markers + 1))
+done
+echo "CYGHEAP_UNWIND completed=$markers/20 (child exit statuses ignored)"
+[ "$markers" -eq 20 ]
+WEDGE_EOF
+WEDGE_WIN=$(cygpath -m "$WEDGE_SH")
+OUT=$(./mxc_gitbash_run.exe "\"$QPRIV\" \"$WEDGE_WIN\"" 2>&1)
+echo "$OUT" | get_stdout | tail -4
+echo "$OUT" | get_stdout | grep -q 'CYGHEAP_UNWIND completed=20/20' \
+  && ok "SEH unwind leaves no wedged cygheap children" \
+  || bad "SEH unwind orphans cygheap lock"
+
 step "mxc controls (informational)"
 OUT=$(./mxc_gitbash_run.exe 'C:\Windows\System32\cmd.exe /c ver' 2>&1)
 echo "$OUT" | grep -q "Microsoft Windows" && echo "note: cmd works in sandbox" || { echo "note: cmd FAILED"; echo "$OUT" | head -8; }
